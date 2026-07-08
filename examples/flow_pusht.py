@@ -70,6 +70,7 @@ flow_base_mode = os.environ.get("FLOW_BASE_MODE", "pure_noise")
 flow_num_steps = int(os.environ.get("FLOW_NUM_STEPS", "1"))
 flow_timestep_distribution = os.environ.get("FLOW_TIMESTEP_DISTRIBUTION", "uniform")
 endpoint_loss_weight = float(os.environ.get("ENDPOINT_LOSS_WEIGHT", "1.0"))
+joint_loss_mode = os.environ.get("JOINT_LOSS_MODE", "token_mean")
 max_train_batches = int(os.environ.get("MAX_TRAIN_BATCHES", "0"))
 checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "./checkpoint_t")
 checkpoint_every_epochs = int(os.environ.get("CHECKPOINT_EVERY_EPOCHS", "1000"))
@@ -98,11 +99,19 @@ joint_normalize_residual = os.environ.get("JOINT_NORMALIZE_RESIDUAL", "1").lower
     "false",
     "no",
 )
+joint_endpoint_index = int(os.environ.get("JOINT_ENDPOINT_INDEX", str(action_horizon - 1)))
+joint_endpoint_token_position = os.environ.get("JOINT_ENDPOINT_TOKEN_POSITION", "endpoint")
 
 if flow_base_mode not in ("pure_noise", "joint_endpoint_residual"):
     raise ValueError("FLOW_BASE_MODE must be pure_noise or joint_endpoint_residual")
 if flow_timestep_distribution not in ("uniform", "beta"):
     raise ValueError("FLOW_TIMESTEP_DISTRIBUTION must be uniform or beta")
+if joint_loss_mode not in ("token_mean", "separate"):
+    raise ValueError("JOINT_LOSS_MODE must be token_mean or separate")
+if not 0 <= joint_endpoint_index < pred_horizon:
+    raise ValueError("JOINT_ENDPOINT_INDEX must be in [0, pred_horizon)")
+if joint_endpoint_token_position not in ("first", "last", "endpoint"):
+    raise ValueError("JOINT_ENDPOINT_TOKEN_POSITION must be first, last, or endpoint")
 if flow_num_steps < 1:
     raise ValueError("FLOW_NUM_STEPS must be at least 1")
 if max_train_batches < 0:
@@ -182,14 +191,18 @@ def endpoint_line_from_current_pos(
     x_pos: torch.Tensor,
     endpoint: torch.Tensor,
 ) -> torch.Tensor:
-    """Straight coarse chunk from current eef position to final action."""
+    """Straight coarse chunk from current eef position to the endpoint action."""
 
-    alpha = torch.linspace(
-        1.0 / pred_horizon,
-        1.0,
-        pred_horizon,
-        device=endpoint.device,
-        dtype=endpoint.dtype,
+    # If endpoint_index is inside the executed action horizon, later unexecuted
+    # tokens are a constant-velocity extrapolation of that same line.
+    alpha = (
+        torch.arange(
+            1,
+            pred_horizon + 1,
+            device=endpoint.device,
+            dtype=endpoint.dtype,
+        )
+        / float(joint_endpoint_index + 1)
     ).view(1, pred_horizon, 1)
     start = current_pos_in_action_space(x_pos).unsqueeze(1)
     return (1.0 - alpha) * start + alpha * endpoint.unsqueeze(1)
@@ -199,10 +212,14 @@ def decompose_endpoint_residual(
     x_pos: torch.Tensor,
     x_traj: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    endpoint = x_traj[:, -1, :]
+    endpoint = x_traj[:, joint_endpoint_index, :]
     coarse = endpoint_line_from_current_pos(x_pos, endpoint)
     residual = x_traj - coarse
-    return endpoint, residual[:, :-1, :], coarse
+    return endpoint, residual[:, joint_residual_indices(), :], coarse
+
+
+def joint_residual_indices() -> list[int]:
+    return [idx for idx in range(pred_horizon) if idx != joint_endpoint_index]
 
 
 def compute_joint_residual_stats() -> tuple[np.ndarray, np.ndarray]:
@@ -230,14 +247,13 @@ def compute_joint_residual_stats() -> tuple[np.ndarray, np.ndarray]:
     current_positions = np.asarray(current_positions, dtype=np.float32)
     current_raw = _unnormalize_np(current_positions, stats["agent_pos"])
     start_action = _normalize_np(current_raw, stats["action"])[:, None, :]
-    endpoint = action_chunks[:, -1:, :]
-    alpha = np.linspace(1.0 / pred_horizon, 1.0, pred_horizon, dtype=np.float32)[
-        None,
-        :,
-        None,
-    ]
+    endpoint = action_chunks[:, joint_endpoint_index : joint_endpoint_index + 1, :]
+    alpha = (
+        np.arange(1, pred_horizon + 1, dtype=np.float32)
+        / float(joint_endpoint_index + 1)
+    )[None, :, None]
     coarse = (1.0 - alpha) * start_action + alpha * endpoint
-    residual_prefix = (action_chunks - coarse)[:, :-1, :]
+    residual_prefix = (action_chunks - coarse)[:, joint_residual_indices(), :]
     return residual_prefix.mean(axis=0).astype(np.float32), _safe_std(
         residual_prefix.std(axis=0),
     )
@@ -333,15 +349,47 @@ def compute_joint_endpoint_residual_loss(
 
     endpoint_t = (1.0 - t_endpoint) * endpoint_noise + t_endpoint * endpoint
     residual_t = (1.0 - t_residual) * residual_noise + t_residual * residual_prefix
-    model_input = torch.cat([endpoint_t.unsqueeze(1), residual_t], dim=1)
+    model_input = pack_joint_tokens(endpoint_t, residual_t)
 
     target_endpoint_v = endpoint - endpoint_noise
     target_residual_v = residual_prefix - residual_noise
     pred_v = nets["noise_pred_net"](model_input, timestep, global_cond=obs_cond)
-    endpoint_loss = torch.mean((pred_v[:, 0, :] - target_endpoint_v) ** 2)
-    residual_loss = torch.mean((pred_v[:, 1:, :] - target_residual_v) ** 2)
-    loss = residual_loss + endpoint_loss_weight * endpoint_loss
+    pred_endpoint_v, pred_residual_v = unpack_joint_velocity(pred_v)
+    endpoint_loss = torch.mean((pred_endpoint_v - target_endpoint_v) ** 2)
+    residual_loss = torch.mean((pred_residual_v - target_residual_v) ** 2)
+    if joint_loss_mode == "token_mean":
+        target_v = pack_joint_tokens(target_endpoint_v, target_residual_v)
+        loss = torch.mean((pred_v - target_v) ** 2)
+    else:
+        loss = residual_loss + endpoint_loss_weight * endpoint_loss
     return loss, endpoint_loss.detach(), residual_loss.detach()
+
+
+def pack_joint_tokens(endpoint: torch.Tensor, residual_prefix: torch.Tensor) -> torch.Tensor:
+    # For temporal UNets, the default puts the endpoint variable at its real
+    # action index and fills the other action indices with residual variables.
+    if joint_endpoint_token_position == "first":
+        return torch.cat([endpoint.unsqueeze(1), residual_prefix], dim=1)
+    if joint_endpoint_token_position == "endpoint":
+        model_input = torch.empty(
+            endpoint.shape[0],
+            pred_horizon,
+            action_dim,
+            device=endpoint.device,
+            dtype=endpoint.dtype,
+        )
+        model_input[:, joint_residual_indices(), :] = residual_prefix
+        model_input[:, joint_endpoint_index, :] = endpoint
+        return model_input
+    return torch.cat([residual_prefix, endpoint.unsqueeze(1)], dim=1)
+
+
+def unpack_joint_velocity(pred_v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if joint_endpoint_token_position == "first":
+        return pred_v[:, 0, :], pred_v[:, 1:, :]
+    if joint_endpoint_token_position == "endpoint":
+        return pred_v[:, joint_endpoint_index, :], pred_v[:, joint_residual_indices(), :]
+    return pred_v[:, -1, :], pred_v[:, :-1, :]
 
 
 def sample_pure_flow_actions(
@@ -369,10 +417,11 @@ def sample_joint_endpoint_residual_actions(
     dt = 1.0 / flow_num_steps
     for i in range(flow_num_steps):
         timestep = torch.full((batch_size,), i * dt, device=device)
-        model_input = torch.cat([endpoint.unsqueeze(1), residual_prefix], dim=1)
+        model_input = pack_joint_tokens(endpoint, residual_prefix)
         pred_v = nets_to_use["noise_pred_net"](model_input, timestep, global_cond=obs_cond)
-        endpoint = endpoint + dt * pred_v[:, 0, :]
-        residual_prefix = residual_prefix + dt * pred_v[:, 1:, :]
+        pred_endpoint_v, pred_residual_v = unpack_joint_velocity(pred_v)
+        endpoint = endpoint + dt * pred_endpoint_v
+        residual_prefix = residual_prefix + dt * pred_residual_v
 
     residual = torch.zeros(batch_size, pred_horizon, action_dim, device=device)
     residual[:, :-1, :] = denormalize_residual_prefix(residual_prefix)
@@ -503,6 +552,9 @@ def train():
             f"max_train_batches={max_train_batches}, "
             f"torch_compile={compile_model}, "
             f"joint_normalize_residual={joint_normalize_residual}, "
+            f"joint_endpoint_index={joint_endpoint_index}, "
+            f"joint_endpoint_token_position={joint_endpoint_token_position}, "
+            f"joint_loss_mode={joint_loss_mode}, "
             f"endpoint_loss_weight={endpoint_loss_weight}",
             "cyan",
         )
@@ -580,6 +632,9 @@ def train():
                         'flow_num_steps': flow_num_steps,
                         'flow_timestep_distribution': flow_timestep_distribution,
                         'joint_normalize_residual': joint_normalize_residual,
+                        'joint_endpoint_index': joint_endpoint_index,
+                        'joint_endpoint_token_position': joint_endpoint_token_position,
+                        'joint_loss_mode': joint_loss_mode,
                         'joint_residual_mean': joint_residual_mean_np,
                         'joint_residual_std': joint_residual_std_np,
                         }, PATH)
@@ -590,6 +645,11 @@ def train():
 ########################################################################
 ###### test the model
 def test():
+    global joint_endpoint_index
+    global joint_endpoint_token_position
+    global joint_residual_mean_np
+    global joint_residual_std_np
+
     PATH = os.environ.get("PUSHT_CHECKPOINT", "./checkpoint_t/flow_ema_03000.pth")
     state_dict = torch.load(PATH, map_location=device, weights_only=False)
     checkpoint_mode = state_dict.get("flow_base_mode")
@@ -601,6 +661,56 @@ def test():
                 "red",
             )
         )
+    if checkpoint_mode == "joint_endpoint_residual":
+        checkpoint_endpoint_index = state_dict.get("joint_endpoint_index")
+        if checkpoint_endpoint_index is None:
+            checkpoint_endpoint_index = pred_horizon - 1
+            print(
+                colored(
+                    "warning: joint checkpoint has no joint_endpoint_index; "
+                    f"assuming legacy pred-horizon endpoint index {checkpoint_endpoint_index}",
+                    "yellow",
+                )
+            )
+        checkpoint_endpoint_index = int(checkpoint_endpoint_index)
+        if checkpoint_endpoint_index != joint_endpoint_index:
+            print(
+                colored(
+                    f"using checkpoint joint_endpoint_index={checkpoint_endpoint_index} "
+                    f"instead of current JOINT_ENDPOINT_INDEX={joint_endpoint_index}",
+                    "yellow",
+                )
+            )
+            joint_endpoint_index = checkpoint_endpoint_index
+        checkpoint_token_position = state_dict.get("joint_endpoint_token_position")
+        if checkpoint_token_position is None:
+            checkpoint_token_position = "first"
+            print(
+                colored(
+                    "warning: joint checkpoint has no joint_endpoint_token_position; "
+                    "assuming legacy first-token layout",
+                    "yellow",
+                )
+            )
+        if checkpoint_token_position != joint_endpoint_token_position:
+            print(
+                colored(
+                    f"using checkpoint joint_endpoint_token_position={checkpoint_token_position} "
+                    f"instead of current JOINT_ENDPOINT_TOKEN_POSITION={joint_endpoint_token_position}",
+                    "yellow",
+                )
+            )
+            joint_endpoint_token_position = checkpoint_token_position
+        if state_dict.get("joint_residual_mean") is not None:
+            joint_residual_mean_np = np.asarray(
+                state_dict["joint_residual_mean"],
+                dtype=np.float32,
+            )
+        if state_dict.get("joint_residual_std") is not None:
+            joint_residual_std_np = np.asarray(
+                state_dict["joint_residual_std"],
+                dtype=np.float32,
+            )
     ema_nets = nets
     load_module_state_dict(ema_nets.vision_encoder, state_dict['vision_encoder'])
     load_module_state_dict(ema_nets.noise_pred_net, state_dict['noise_pred_net'])
