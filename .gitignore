@@ -1,0 +1,5 @@
+venv_fm/
+__pycache__/
+*.pyc
+pusht_cchi_v7_replay.zarr.zip
+*.pth

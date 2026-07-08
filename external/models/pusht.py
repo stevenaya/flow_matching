@@ -691,7 +691,7 @@ class PushTImageDataset(torch.utils.data.Dataset):
                  obs_horizon: int,
                  action_horizon: int):
         # read from zarr dataset
-        dataset_root = zarr.open(dataset_path, 'r')
+        dataset_root = zarr.open(dataset_path, mode='r')
 
         # float32, [0,1], (N,96,96,3)
         train_image_data = dataset_root['data']['img'][:]
