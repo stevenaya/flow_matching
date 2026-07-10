@@ -135,6 +135,7 @@ class ConditionalUnet1D(nn.Module):
                  global_cond_dim,
                  diffusion_step_embed_dim=256,
                  down_dims=[256, 512, 1024],
+                 local_cond_dim=0,
                  kernel_size=5,
                  n_groups=8
                  ):
@@ -145,12 +146,15 @@ class ConditionalUnet1D(nn.Module):
         diffusion_step_embed_dim: Size of positional encoding for diffusion iteration k
         down_dims: Channel size for each UNet level.
           The length of this array determines numebr of levels.
+        local_cond_dim: Per-token conditioning channels concatenated to x.
         kernel_size: Conv kernel size
         n_groups: Number of groups for GroupNorm
         """
 
         super().__init__()
-        all_dims = [input_dim] + list(down_dims)
+        self.input_dim = input_dim
+        self.local_cond_dim = local_cond_dim
+        all_dims = [input_dim + local_cond_dim] + list(down_dims)
         start_dim = down_dims[0]
 
         dsed = diffusion_step_embed_dim
@@ -219,13 +223,25 @@ class ConditionalUnet1D(nn.Module):
     def forward(self,
                 sample: torch.Tensor,
                 timestep: Union[torch.Tensor, float, int],
-                global_cond=None):
+                global_cond=None,
+                local_cond=None):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         global_cond: (B,global_cond_dim)
+        local_cond: (B,T,local_cond_dim)
         output: (B,T,input_dim)
         """
+        if self.local_cond_dim > 0:
+            if local_cond is None:
+                raise ValueError("local_cond is required when local_cond_dim > 0")
+            if local_cond.shape[:2] != sample.shape[:2]:
+                raise ValueError("local_cond must have the same batch and horizon as sample")
+            if local_cond.shape[-1] != self.local_cond_dim:
+                raise ValueError("local_cond last dimension does not match local_cond_dim")
+            local_cond = local_cond.to(device=sample.device, dtype=sample.dtype)
+            sample = torch.cat([sample, local_cond], dim=-1)
+
         # (B,T,C)
         sample = sample.moveaxis(-1, -2)
         # (B,C,T)

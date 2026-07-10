@@ -1,9 +1,10 @@
 #pusht
+--extra-index-url https://download.pytorch.org/whl/cu128
 wheel==0.47.0
 numpy==2.5.1
 pytorch-lightning==1.9.5
-torch==2.12.1
-torchvision==0.27.1
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
 zarr==3.2.1
 diffusers==0.39.0
 tqdm==4.68.4
@@ -15,7 +16,9 @@ opencv-python==5.0.0.93
 scikit-image==0.26.0
 scikit-learn==1.9.0
 scikit-video==1.1.11
+imageio-ffmpeg==0.6.0
 gdown==6.1.0
+wandb==0.23.1
 
 # flow_pusht
 matplotlib==3.11.0
