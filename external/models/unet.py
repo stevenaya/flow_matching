@@ -28,6 +28,25 @@ import gdown
 import os
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+class EagerGroupNorm(nn.GroupNorm):
+    @torch._dynamo.disable
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return super().forward(input)
+
+
+def make_group_norm(n_groups: int, out_channels: int) -> nn.GroupNorm:
+    if env_flag("UNET_EAGER_GROUP_NORM", False):
+        return EagerGroupNorm(n_groups, out_channels)
+    return nn.GroupNorm(n_groups, out_channels)
+
+
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -71,7 +90,7 @@ class Conv1dBlock(nn.Module):
 
         self.block = nn.Sequential(
             nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
-            nn.GroupNorm(n_groups, out_channels),
+            make_group_norm(n_groups, out_channels),
             nn.Mish(),
         )
 
@@ -243,7 +262,7 @@ class ConditionalUnet1D(nn.Module):
             sample = torch.cat([sample, local_cond], dim=-1)
 
         # (B,T,C)
-        sample = sample.moveaxis(-1, -2)
+        sample = sample.moveaxis(-1, -2).contiguous()
         # (B,C,T)
 
         # 1. time
@@ -284,6 +303,6 @@ class ConditionalUnet1D(nn.Module):
         x = self.final_conv(x)
 
         # (B,C,T)
-        x = x.moveaxis(-1, -2)
+        x = x.moveaxis(-1, -2).contiguous()
         # (B,T,C)
         return x

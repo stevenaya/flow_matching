@@ -34,6 +34,7 @@
 import sys
 import os
 import time
+from dataclasses import dataclass
 
 sys.dont_write_bytecode = True
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'external'))
@@ -111,6 +112,7 @@ checkpoint_every_epochs = int(os.environ.get("CHECKPOINT_EVERY_EPOCHS", "1000"))
 compile_model = os.environ.get("TORCH_COMPILE", "0").lower() in ("1", "true", "yes")
 compile_mode = os.environ.get("TORCH_COMPILE_MODE", "default")
 batch_size = int(os.environ.get("BATCH_SIZE", "64"))
+drop_last = os.environ.get("DROP_LAST", "1").lower() not in ("0", "false", "no")
 num_workers = int(os.environ.get("NUM_WORKERS", "4"))
 pin_memory = os.environ.get("PIN_MEMORY", "1").lower() not in ("0", "false", "no")
 persistent_workers = os.environ.get("PERSISTENT_WORKERS", "1").lower() not in (
@@ -134,6 +136,17 @@ joint_normalize_residual = os.environ.get("JOINT_NORMALIZE_RESIDUAL", "1").lower
     "no",
 )
 joint_endpoint_param = os.environ.get("JOINT_ENDPOINT_PARAM", "endpoint")
+joint_variable_space = os.environ.get("JOINT_VARIABLE_SPACE", "normalized_action").lower()
+if joint_variable_space == "normalized":
+    joint_variable_space = "normalized_action"
+elif joint_variable_space == "raw":
+    joint_variable_space = "raw_action"
+joint_variable_norm = os.environ.get("JOINT_VARIABLE_NORM", "zscore").lower()
+joint_residual_stats_mode = os.environ.get("JOINT_RESIDUAL_STATS_MODE", "per_position").lower()
+if joint_residual_stats_mode in ("position", "per_token", "token"):
+    joint_residual_stats_mode = "per_position"
+elif joint_residual_stats_mode in ("all", "global"):
+    joint_residual_stats_mode = "shared"
 joint_endpoint_index = int(os.environ.get("JOINT_ENDPOINT_INDEX", str(action_horizon - 1)))
 joint_endpoint_token_position = os.environ.get("JOINT_ENDPOINT_TOKEN_POSITION", "endpoint")
 transformer_n_layer = int(os.environ.get("TRANSFORMER_N_LAYER", "8"))
@@ -154,6 +167,12 @@ if joint_loss_mode not in ("token_mean", "separate"):
     raise ValueError("JOINT_LOSS_MODE must be token_mean or separate")
 if joint_endpoint_param not in ("endpoint", "mean_velocity"):
     raise ValueError("JOINT_ENDPOINT_PARAM must be endpoint or mean_velocity")
+if joint_variable_space not in ("normalized_action", "raw_action"):
+    raise ValueError("JOINT_VARIABLE_SPACE must be normalized_action or raw_action")
+if joint_variable_norm not in ("zscore", "minmax"):
+    raise ValueError("JOINT_VARIABLE_NORM must be zscore or minmax")
+if joint_residual_stats_mode not in ("per_position", "shared"):
+    raise ValueError("JOINT_RESIDUAL_STATS_MODE must be per_position or shared")
 if not 0 <= joint_endpoint_index < pred_horizon:
     raise ValueError("JOINT_ENDPOINT_INDEX must be in [0, pred_horizon)")
 if joint_endpoint_token_position not in ("first", "last", "endpoint"):
@@ -228,6 +247,10 @@ def _safe_std(std: np.ndarray) -> np.ndarray:
     return np.maximum(std, 1e-6).astype(np.float32)
 
 
+def _safe_range(min_value: np.ndarray, max_value: np.ndarray) -> np.ndarray:
+    return np.maximum(max_value - min_value, 1e-6).astype(np.float32)
+
+
 def _normalize_np(data: np.ndarray, data_stats: dict[str, np.ndarray]) -> np.ndarray:
     return ((data - data_stats["min"]) / (data_stats["max"] - data_stats["min"])) * 2.0 - 1.0
 
@@ -252,12 +275,52 @@ def _unnormalize_torch(normalized: torch.Tensor, key: str) -> torch.Tensor:
     return ((normalized + 1.0) / 2.0) * (stat_max - stat_min) + stat_min
 
 
+def _minmax_normalize_torch(
+    data: torch.Tensor,
+    min_value: torch.Tensor,
+    max_value: torch.Tensor,
+) -> torch.Tensor:
+    value_range = torch.clamp(max_value - min_value, min=1e-6)
+    return ((data - min_value) / value_range) * 2.0 - 1.0
+
+
+def _minmax_denormalize_torch(
+    data: torch.Tensor,
+    min_value: torch.Tensor,
+    max_value: torch.Tensor,
+) -> torch.Tensor:
+    value_range = torch.clamp(max_value - min_value, min=1e-6)
+    return ((data + 1.0) / 2.0) * value_range + min_value
+
+
 def current_pos_in_action_space(x_pos: torch.Tensor) -> torch.Tensor:
-    """Convert normalized agent_pos into normalized action coordinates."""
+    """Convert normalized agent_pos into the configured joint variable coordinates."""
 
     latest_pos = x_pos[:, obs_horizon - 1, :]
     raw_pos = _unnormalize_torch(latest_pos, "agent_pos")
+    if joint_variable_space == "raw_action":
+        return raw_pos
     return _normalize_torch(raw_pos, "action")
+
+
+def normalized_action_to_joint_space(x_traj: torch.Tensor) -> torch.Tensor:
+    if joint_variable_space == "raw_action":
+        return _unnormalize_torch(x_traj, "action")
+    return x_traj
+
+
+def joint_space_to_normalized_action(x_traj: torch.Tensor) -> torch.Tensor:
+    if joint_variable_space == "raw_action":
+        return _normalize_torch(x_traj, "action")
+    return x_traj
+
+
+def use_endpoint_variable_stats() -> bool:
+    return (
+        joint_endpoint_param != "endpoint"
+        or joint_variable_space == "raw_action"
+        or joint_variable_norm == "minmax"
+    )
 
 
 def endpoint_line_from_current_pos(
@@ -331,6 +394,7 @@ def decompose_endpoint_residual(
     x_pos: torch.Tensor,
     x_traj: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_traj = normalized_action_to_joint_space(x_traj)
     endpoint = x_traj[:, joint_endpoint_index, :]
     endpoint_variable = joint_endpoint_variable_from_endpoint(x_pos, endpoint)
     coarse = joint_line_from_endpoint_variable(x_pos, endpoint_variable)
@@ -342,17 +406,26 @@ def joint_residual_indices() -> list[int]:
     return [idx for idx in range(pred_horizon) if idx != joint_endpoint_index]
 
 
-def compute_joint_residual_stats() -> tuple[np.ndarray, np.ndarray]:
-    """Stats for residual prefix in normalized action coordinates."""
+def _mean_std_min_max_np(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return (
+        data.mean(axis=0).astype(np.float32),
+        _safe_std(data.std(axis=0)),
+        data.min(axis=0).astype(np.float32),
+        data.max(axis=0).astype(np.float32),
+    )
+
+
+def compute_joint_residual_stats() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Stats for residual prefix in the configured joint variable coordinates."""
 
     action_chunks, start_action = collect_action_chunks_and_starts()
     endpoint = action_chunks[:, joint_endpoint_index, :]
     endpoint_variable = endpoint_variable_from_endpoint_np(start_action[:, 0, :], endpoint)
     coarse = joint_line_from_endpoint_variable_np(start_action, endpoint_variable)
     residual_prefix = (action_chunks - coarse)[:, joint_residual_indices(), :]
-    return residual_prefix.mean(axis=0).astype(np.float32), _safe_std(
-        residual_prefix.std(axis=0),
-    )
+    if joint_residual_stats_mode == "shared":
+        residual_prefix = residual_prefix.reshape(-1, action_dim)
+    return _mean_std_min_max_np(residual_prefix)
 
 
 def collect_action_chunks_and_starts() -> tuple[np.ndarray, np.ndarray]:
@@ -377,7 +450,11 @@ def collect_action_chunks_and_starts() -> tuple[np.ndarray, np.ndarray]:
     action_chunks = np.asarray(action_chunks, dtype=np.float32)
     current_positions = np.asarray(current_positions, dtype=np.float32)
     current_raw = _unnormalize_np(current_positions, stats["agent_pos"])
-    start_action = _normalize_np(current_raw, stats["action"])[:, None, :]
+    if joint_variable_space == "raw_action":
+        action_chunks = _unnormalize_np(action_chunks, stats["action"])
+        start_action = current_raw[:, None, :]
+    else:
+        start_action = _normalize_np(current_raw, stats["action"])[:, None, :]
     return action_chunks, start_action
 
 
@@ -409,95 +486,163 @@ def joint_line_from_endpoint_variable_np(
     raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
 
 
-def compute_joint_endpoint_variable_stats() -> tuple[np.ndarray, np.ndarray]:
+def compute_joint_endpoint_variable_stats() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     action_chunks, start_action = collect_action_chunks_and_starts()
     endpoint = action_chunks[:, joint_endpoint_index : joint_endpoint_index + 1, :]
     endpoint_variable = endpoint_variable_from_endpoint_np(
         start_action[:, 0, :],
         endpoint[:, 0, :],
     )
-    return endpoint_variable.mean(axis=0).astype(np.float32), _safe_std(
-        endpoint_variable.std(axis=0),
-    )
+    return _mean_std_min_max_np(endpoint_variable)
 
 
-joint_residual_mean_np = None
-joint_residual_std_np = None
-joint_residual_mean = None
-joint_residual_std = None
-joint_endpoint_mean_np = None
-joint_endpoint_std_np = None
-joint_endpoint_mean = None
-joint_endpoint_std = None
+@dataclass
+class JointVariableStats:
+    mean_np: np.ndarray | None = None
+    std_np: np.ndarray | None = None
+    min_np: np.ndarray | None = None
+    max_np: np.ndarray | None = None
+    mean: torch.Tensor | None = None
+    std: torch.Tensor | None = None
+    min: torch.Tensor | None = None
+    max: torch.Tensor | None = None
+
+    @classmethod
+    def from_values(
+        cls,
+        values: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        *,
+        add_batch_dim: bool,
+    ) -> "JointVariableStats":
+        stats_obj = cls(*values)
+        stats_obj.attach_tensors(add_batch_dim=add_batch_dim)
+        return stats_obj
+
+    @classmethod
+    def from_checkpoint(cls, state_dict: dict, prefix: str) -> "JointVariableStats":
+        def get_np(name: str) -> np.ndarray | None:
+            value = state_dict.get(f"{prefix}_{name}")
+            if value is None:
+                return None
+            return np.asarray(value, dtype=np.float32)
+
+        return cls(
+            mean_np=get_np("mean"),
+            std_np=get_np("std"),
+            min_np=get_np("min"),
+            max_np=get_np("max"),
+        )
+
+    def attach_tensors(self, *, add_batch_dim: bool) -> None:
+        def as_tensor(value: np.ndarray | None) -> torch.Tensor | None:
+            if value is None:
+                return None
+            tensor = torch.as_tensor(value, device=device, dtype=torch.float32)
+            return tensor.unsqueeze(0) if add_batch_dim else tensor
+
+        self.mean = as_tensor(self.mean_np)
+        self.std = as_tensor(self.std_np)
+        self.min = as_tensor(self.min_np)
+        self.max = as_tensor(self.max_np)
+
+    def missing_for_norm(self, norm: str) -> bool:
+        if norm == "zscore":
+            return self.mean_np is None or self.std_np is None
+        return self.min_np is None or self.max_np is None
+
+    def checkpoint_items(self, prefix: str) -> dict[str, np.ndarray | None]:
+        return {
+            f"{prefix}_mean": self.mean_np,
+            f"{prefix}_std": self.std_np,
+            f"{prefix}_min": self.min_np,
+            f"{prefix}_max": self.max_np,
+        }
+
+    def normalize(self, value: torch.Tensor, norm: str) -> torch.Tensor:
+        if norm == "zscore":
+            mean = self._tensor("mean", value)
+            std = self._tensor("std", value)
+            return (value - mean) / std
+        return _minmax_normalize_torch(
+            value,
+            self._tensor("min", value),
+            self._tensor("max", value),
+        )
+
+    def denormalize(self, value: torch.Tensor, norm: str) -> torch.Tensor:
+        if norm == "zscore":
+            mean = self._tensor("mean", value)
+            std = self._tensor("std", value)
+            return value * std + mean
+        return _minmax_denormalize_torch(
+            value,
+            self._tensor("min", value),
+            self._tensor("max", value),
+        )
+
+    def _tensor(self, name: str, ref: torch.Tensor) -> torch.Tensor:
+        tensor = getattr(self, name)
+        if tensor is None:
+            raise RuntimeError(f"Missing joint {name} stats for JOINT_VARIABLE_NORM={joint_variable_norm}")
+        return tensor.to(device=ref.device, dtype=ref.dtype)
+
+
+joint_residual_stats = JointVariableStats()
+joint_endpoint_stats = JointVariableStats()
 if flow_base_mode == "joint_endpoint_residual" and joint_normalize_residual:
-    joint_residual_mean_np, joint_residual_std_np = compute_joint_residual_stats()
-    joint_residual_mean = torch.as_tensor(
-        joint_residual_mean_np,
-        device=device,
-        dtype=torch.float32,
-    ).unsqueeze(0)
-    joint_residual_std = torch.as_tensor(
-        joint_residual_std_np,
-        device=device,
-        dtype=torch.float32,
-    ).unsqueeze(0)
+    joint_residual_stats = JointVariableStats.from_values(
+        compute_joint_residual_stats(),
+        add_batch_dim=True,
+    )
     print(
         "Joint residual stats: "
-        f"mean_abs={np.abs(joint_residual_mean_np).mean():.4f}, "
-        f"std_mean={joint_residual_std_np.mean():.4f}, "
-        f"std_min={joint_residual_std_np.min():.4f}, "
-        f"std_max={joint_residual_std_np.max():.4f}"
+        f"space={joint_variable_space}, norm={joint_variable_norm}, "
+        f"residual_stats_mode={joint_residual_stats_mode}, "
+        f"stats_shape={joint_residual_stats.mean_np.shape}, "
+        f"mean_abs={np.abs(joint_residual_stats.mean_np).mean():.4f}, "
+        f"std_mean={joint_residual_stats.std_np.mean():.4f}, "
+        f"std_min={joint_residual_stats.std_np.min():.4f}, "
+        f"std_max={joint_residual_stats.std_np.max():.4f}, "
+        f"range_mean={_safe_range(joint_residual_stats.min_np, joint_residual_stats.max_np).mean():.4f}"
     )
-if flow_base_mode == "joint_endpoint_residual" and joint_endpoint_param != "endpoint":
-    joint_endpoint_mean_np, joint_endpoint_std_np = compute_joint_endpoint_variable_stats()
-    joint_endpoint_mean = torch.as_tensor(
-        joint_endpoint_mean_np,
-        device=device,
-        dtype=torch.float32,
-    )
-    joint_endpoint_std = torch.as_tensor(
-        joint_endpoint_std_np,
-        device=device,
-        dtype=torch.float32,
+if flow_base_mode == "joint_endpoint_residual" and use_endpoint_variable_stats():
+    joint_endpoint_stats = JointVariableStats.from_values(
+        compute_joint_endpoint_variable_stats(),
+        add_batch_dim=False,
     )
     print(
         "Joint endpoint variable stats: "
         f"param={joint_endpoint_param}, "
-        f"mean={joint_endpoint_mean_np.tolist()}, "
-        f"std={joint_endpoint_std_np.tolist()}"
+        f"space={joint_variable_space}, norm={joint_variable_norm}, "
+        f"mean={joint_endpoint_stats.mean_np.tolist()}, "
+        f"std={joint_endpoint_stats.std_np.tolist()}, "
+        f"min={joint_endpoint_stats.min_np.tolist()}, "
+        f"max={joint_endpoint_stats.max_np.tolist()}"
     )
 
 
 def normalize_residual_prefix(residual_prefix: torch.Tensor) -> torch.Tensor:
     if not joint_normalize_residual:
         return residual_prefix
-    mean = joint_residual_mean.to(device=residual_prefix.device, dtype=residual_prefix.dtype)
-    std = joint_residual_std.to(device=residual_prefix.device, dtype=residual_prefix.dtype)
-    return (residual_prefix - mean) / std
+    return joint_residual_stats.normalize(residual_prefix, joint_variable_norm)
 
 
 def denormalize_residual_prefix(residual_prefix: torch.Tensor) -> torch.Tensor:
     if not joint_normalize_residual:
         return residual_prefix
-    mean = joint_residual_mean.to(device=residual_prefix.device, dtype=residual_prefix.dtype)
-    std = joint_residual_std.to(device=residual_prefix.device, dtype=residual_prefix.dtype)
-    return residual_prefix * std + mean
+    return joint_residual_stats.denormalize(residual_prefix, joint_variable_norm)
 
 
 def normalize_endpoint_variable(endpoint_variable: torch.Tensor) -> torch.Tensor:
-    if joint_endpoint_param == "endpoint":
+    if not use_endpoint_variable_stats():
         return endpoint_variable
-    mean = joint_endpoint_mean.to(device=endpoint_variable.device, dtype=endpoint_variable.dtype)
-    std = joint_endpoint_std.to(device=endpoint_variable.device, dtype=endpoint_variable.dtype)
-    return (endpoint_variable - mean) / std
+    return joint_endpoint_stats.normalize(endpoint_variable, joint_variable_norm)
 
 
 def denormalize_endpoint_variable(endpoint_variable: torch.Tensor) -> torch.Tensor:
-    if joint_endpoint_param == "endpoint":
+    if not use_endpoint_variable_stats():
         return endpoint_variable
-    mean = joint_endpoint_mean.to(device=endpoint_variable.device, dtype=endpoint_variable.dtype)
-    std = joint_endpoint_std.to(device=endpoint_variable.device, dtype=endpoint_variable.dtype)
-    return endpoint_variable * std + mean
+    return joint_endpoint_stats.denormalize(endpoint_variable, joint_variable_norm)
 
 
 def sample_flow_timestep(batch_size: int, ref: torch.Tensor) -> torch.Tensor:
@@ -619,8 +764,8 @@ def token_local_cond(nets_to_use: nn.ModuleDict, sample: torch.Tensor) -> torch.
         type_ids = token_type_ids_for_sample(sample)
         local_features.append(nets_to_use["token_type_embedding"](type_ids))
     local_cond = torch.cat(local_features, dim=-1)
-    local_cond = local_cond.unsqueeze(0).expand(sample.shape[0], -1, -1)
-    return local_cond.to(dtype=sample.dtype)
+    local_cond = local_cond.unsqueeze(0).expand(sample.shape[0], -1, -1).contiguous()
+    return local_cond.to(device=sample.device, dtype=sample.dtype).contiguous()
 
 
 def predict_velocity(
@@ -629,6 +774,9 @@ def predict_velocity(
     timestep: torch.Tensor,
     obs_cond: torch.Tensor,
 ) -> torch.Tensor:
+    sample = sample.contiguous()
+    timestep = timestep.contiguous()
+    obs_cond = obs_cond.contiguous()
     if policy_backbone == "transformer":
         local_cond = token_local_cond(nets_to_use, sample)
         if local_cond is not None:
@@ -676,7 +824,8 @@ def sample_joint_endpoint_residual_actions(
     residual = torch.zeros(batch_size, pred_horizon, action_dim, device=device)
     residual[:, joint_residual_indices(), :] = denormalize_residual_prefix(residual_prefix)
     endpoint_variable_action = denormalize_endpoint_variable(endpoint)
-    return joint_line_from_endpoint_variable(x_pos, endpoint_variable_action) + residual
+    traj = joint_line_from_endpoint_variable(x_pos, endpoint_variable_action) + residual
+    return joint_space_to_normalized_action(traj)
 
 
 def sample_actions(nets_to_use: nn.ModuleDict, obs_cond: torch.Tensor, x_pos: torch.Tensor) -> torch.Tensor:
@@ -729,6 +878,7 @@ dataloader_kwargs = {
     "batch_size": batch_size,
     "num_workers": num_workers,
     "shuffle": True,
+    "drop_last": drop_last,
     "pin_memory": pin_memory,
     "persistent_workers": persistent_workers,
 }
@@ -862,6 +1012,7 @@ def train():
             f"token_position_embed_dim={token_position_embed_dim if use_token_embeddings else 0}, "
             f"token_type_embed_dim={token_type_embed_dim if use_token_embeddings else 0}, "
             f"batch_size={batch_size}, "
+            f"drop_last={drop_last}, "
             f"num_workers={num_workers}, "
             f"use_amp={use_amp}, "
             f"amp_dtype={amp_dtype_name}, "
@@ -870,6 +1021,9 @@ def train():
             f"torch_compile={compile_model}, "
             f"joint_normalize_residual={joint_normalize_residual}, "
             f"joint_endpoint_param={joint_endpoint_param}, "
+            f"joint_variable_space={joint_variable_space}, "
+            f"joint_variable_norm={joint_variable_norm}, "
+            f"joint_residual_stats_mode={joint_residual_stats_mode}, "
             f"joint_endpoint_index={joint_endpoint_index}, "
             f"joint_endpoint_token_position={joint_endpoint_token_position}, "
             f"joint_loss_mode={joint_loss_mode}, "
@@ -1041,13 +1195,14 @@ def train():
                         ) if use_token_embeddings and token_type_embed_dim > 0 else None,
                         'joint_normalize_residual': joint_normalize_residual,
                         'joint_endpoint_param': joint_endpoint_param,
+                        'joint_variable_space': joint_variable_space,
+                        'joint_variable_norm': joint_variable_norm,
+                        'joint_residual_stats_mode': joint_residual_stats_mode,
                         'joint_endpoint_index': joint_endpoint_index,
                         'joint_endpoint_token_position': joint_endpoint_token_position,
                         'joint_loss_mode': joint_loss_mode,
-                        'joint_endpoint_mean': joint_endpoint_mean_np,
-                        'joint_endpoint_std': joint_endpoint_std_np,
-                        'joint_residual_mean': joint_residual_mean_np,
-                        'joint_residual_std': joint_residual_std_np,
+                        **joint_endpoint_stats.checkpoint_items("joint_endpoint"),
+                        **joint_residual_stats.checkpoint_items("joint_residual"),
                         }, PATH)
             print(colored(f"saved checkpoint: {PATH}", "green"))
             ema.restore(nets.parameters())
@@ -1079,6 +1234,7 @@ def init_wandb_for_train(train_config: dict[str, object]):
             "flow_num_steps": flow_num_steps,
             "flow_timestep_distribution": flow_timestep_distribution,
             "batch_size": batch_size,
+            "drop_last": drop_last,
             "num_workers": num_workers,
             "use_amp": use_amp,
             "amp_dtype": amp_dtype_name,
@@ -1090,6 +1246,9 @@ def init_wandb_for_train(train_config: dict[str, object]):
             "checkpoint_every_epochs": checkpoint_every_epochs,
             "joint_normalize_residual": joint_normalize_residual,
             "joint_endpoint_param": joint_endpoint_param,
+            "joint_variable_space": joint_variable_space,
+            "joint_variable_norm": joint_variable_norm,
+            "joint_residual_stats_mode": joint_residual_stats_mode,
             "joint_endpoint_index": joint_endpoint_index,
             "joint_endpoint_token_position": joint_endpoint_token_position,
             "joint_loss_mode": joint_loss_mode,
@@ -1150,6 +1309,9 @@ def init_wandb_for_test(checkpoint_path: str, test_config: dict[str, object]):
             "flow_num_steps": flow_num_steps,
             "flow_timestep_distribution": flow_timestep_distribution,
             "joint_endpoint_param": joint_endpoint_param,
+            "joint_variable_space": joint_variable_space,
+            "joint_variable_norm": joint_variable_norm,
+            "joint_residual_stats_mode": joint_residual_stats_mode,
             "joint_endpoint_index": joint_endpoint_index,
             "joint_endpoint_token_position": joint_endpoint_token_position,
             "joint_loss_mode": joint_loss_mode,
@@ -1379,16 +1541,13 @@ def test():
     global flow_base_mode
     global flow_num_steps
     global joint_endpoint_param
+    global joint_variable_space
+    global joint_variable_norm
+    global joint_residual_stats_mode
     global joint_endpoint_index
     global joint_endpoint_token_position
-    global joint_endpoint_mean_np
-    global joint_endpoint_std_np
-    global joint_endpoint_mean
-    global joint_endpoint_std
-    global joint_residual_mean_np
-    global joint_residual_std_np
-    global joint_residual_mean
-    global joint_residual_std
+    global joint_endpoint_stats
+    global joint_residual_stats
 
     PATH = os.environ.get("PUSHT_CHECKPOINT", "./checkpoint_t/flow_ema_03000.pth")
     state_dict = torch.load(PATH, map_location=device, weights_only=False)
@@ -1493,6 +1652,49 @@ def test():
                 )
             )
             joint_endpoint_param = checkpoint_endpoint_param
+        checkpoint_variable_space = state_dict.get("joint_variable_space", "normalized_action")
+        if checkpoint_variable_space == "normalized":
+            checkpoint_variable_space = "normalized_action"
+        elif checkpoint_variable_space == "raw":
+            checkpoint_variable_space = "raw_action"
+        if checkpoint_variable_space != joint_variable_space:
+            print(
+                colored(
+                    f"using checkpoint joint_variable_space={checkpoint_variable_space} "
+                    f"instead of current JOINT_VARIABLE_SPACE={joint_variable_space}",
+                    "yellow",
+                )
+            )
+            joint_variable_space = checkpoint_variable_space
+        checkpoint_variable_norm = state_dict.get("joint_variable_norm", "zscore")
+        if checkpoint_variable_norm != joint_variable_norm:
+            print(
+                colored(
+                    f"using checkpoint joint_variable_norm={checkpoint_variable_norm} "
+                    f"instead of current JOINT_VARIABLE_NORM={joint_variable_norm}",
+                    "yellow",
+                )
+            )
+            joint_variable_norm = checkpoint_variable_norm
+        checkpoint_residual_stats_mode = state_dict.get("joint_residual_stats_mode")
+        if checkpoint_residual_stats_mode is None:
+            checkpoint_residual_stats_mode = "shared" if (
+                state_dict.get("joint_residual_mean") is not None
+                and np.asarray(state_dict["joint_residual_mean"]).ndim == 1
+            ) else "per_position"
+        if checkpoint_residual_stats_mode in ("position", "per_token", "token"):
+            checkpoint_residual_stats_mode = "per_position"
+        elif checkpoint_residual_stats_mode in ("all", "global"):
+            checkpoint_residual_stats_mode = "shared"
+        if checkpoint_residual_stats_mode != joint_residual_stats_mode:
+            print(
+                colored(
+                    f"using checkpoint joint_residual_stats_mode={checkpoint_residual_stats_mode} "
+                    f"instead of current JOINT_RESIDUAL_STATS_MODE={joint_residual_stats_mode}",
+                    "yellow",
+                )
+            )
+            joint_residual_stats_mode = checkpoint_residual_stats_mode
         checkpoint_endpoint_index = state_dict.get("joint_endpoint_index")
         if checkpoint_endpoint_index is None:
             checkpoint_endpoint_index = pred_horizon - 1
@@ -1532,18 +1734,12 @@ def test():
                 )
             )
             joint_endpoint_token_position = checkpoint_token_position
-        if state_dict.get("joint_endpoint_mean") is not None:
-            joint_endpoint_mean_np = np.asarray(
-                state_dict["joint_endpoint_mean"],
-                dtype=np.float32,
-            )
-        if state_dict.get("joint_endpoint_std") is not None:
-            joint_endpoint_std_np = np.asarray(
-                state_dict["joint_endpoint_std"],
-                dtype=np.float32,
-            )
-        if joint_endpoint_param != "endpoint":
-            if joint_endpoint_mean_np is None or joint_endpoint_std_np is None:
+        joint_endpoint_stats = JointVariableStats.from_checkpoint(
+            state_dict,
+            "joint_endpoint",
+        )
+        if use_endpoint_variable_stats():
+            if joint_endpoint_stats.missing_for_norm(joint_variable_norm):
                 print(
                     colored(
                         "warning: joint checkpoint has no endpoint variable stats; "
@@ -1551,40 +1747,32 @@ def test():
                         "yellow",
                     )
                 )
-                joint_endpoint_mean_np, joint_endpoint_std_np = (
-                    compute_joint_endpoint_variable_stats()
+                joint_endpoint_stats = JointVariableStats.from_values(
+                    compute_joint_endpoint_variable_stats(),
+                    add_batch_dim=False,
                 )
-            joint_endpoint_mean = torch.as_tensor(
-                joint_endpoint_mean_np,
-                device=device,
-                dtype=torch.float32,
-            )
-            joint_endpoint_std = torch.as_tensor(
-                joint_endpoint_std_np,
-                device=device,
-                dtype=torch.float32,
-            )
-        if state_dict.get("joint_residual_mean") is not None:
-            joint_residual_mean_np = np.asarray(
-                state_dict["joint_residual_mean"],
-                dtype=np.float32,
-            )
-        if state_dict.get("joint_residual_std") is not None:
-            joint_residual_std_np = np.asarray(
-                state_dict["joint_residual_std"],
-                dtype=np.float32,
-            )
-        if joint_residual_mean_np is not None and joint_residual_std_np is not None:
-            joint_residual_mean = torch.as_tensor(
-                joint_residual_mean_np,
-                device=device,
-                dtype=torch.float32,
-            ).unsqueeze(0)
-            joint_residual_std = torch.as_tensor(
-                joint_residual_std_np,
-                device=device,
-                dtype=torch.float32,
-            ).unsqueeze(0)
+            else:
+                joint_endpoint_stats.attach_tensors(add_batch_dim=False)
+
+        joint_residual_stats = JointVariableStats.from_checkpoint(
+            state_dict,
+            "joint_residual",
+        )
+        if joint_normalize_residual:
+            if joint_residual_stats.missing_for_norm(joint_variable_norm):
+                print(
+                    colored(
+                        "warning: joint checkpoint has no residual stats; "
+                        "recomputing them from the current dataset",
+                        "yellow",
+                    )
+                )
+                joint_residual_stats = JointVariableStats.from_values(
+                    compute_joint_residual_stats(),
+                    add_batch_dim=True,
+                )
+            else:
+                joint_residual_stats.attach_tensors(add_batch_dim=True)
     ema_nets = nets
     load_module_state_dict(ema_nets.vision_encoder, state_dict['vision_encoder'])
     load_module_state_dict(ema_nets.noise_pred_net, state_dict['noise_pred_net'])
