@@ -133,6 +133,7 @@ joint_normalize_residual = os.environ.get("JOINT_NORMALIZE_RESIDUAL", "1").lower
     "false",
     "no",
 )
+joint_endpoint_param = os.environ.get("JOINT_ENDPOINT_PARAM", "endpoint")
 joint_endpoint_index = int(os.environ.get("JOINT_ENDPOINT_INDEX", str(action_horizon - 1)))
 joint_endpoint_token_position = os.environ.get("JOINT_ENDPOINT_TOKEN_POSITION", "endpoint")
 transformer_n_layer = int(os.environ.get("TRANSFORMER_N_LAYER", "8"))
@@ -151,6 +152,8 @@ if flow_timestep_distribution not in ("uniform", "beta"):
     raise ValueError("FLOW_TIMESTEP_DISTRIBUTION must be uniform or beta")
 if joint_loss_mode not in ("token_mean", "separate"):
     raise ValueError("JOINT_LOSS_MODE must be token_mean or separate")
+if joint_endpoint_param not in ("endpoint", "mean_velocity"):
+    raise ValueError("JOINT_ENDPOINT_PARAM must be endpoint or mean_velocity")
 if not 0 <= joint_endpoint_index < pred_horizon:
     raise ValueError("JOINT_ENDPOINT_INDEX must be in [0, pred_horizon)")
 if joint_endpoint_token_position not in ("first", "last", "endpoint"):
@@ -278,14 +281,61 @@ def endpoint_line_from_current_pos(
     return (1.0 - alpha) * start + alpha * endpoint.unsqueeze(1)
 
 
+def joint_step_weights(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return torch.arange(
+        1,
+        pred_horizon + 1,
+        device=device,
+        dtype=dtype,
+    ).view(1, pred_horizon, 1)
+
+
+def joint_endpoint_variable_from_endpoint(
+    x_pos: torch.Tensor,
+    endpoint: torch.Tensor,
+) -> torch.Tensor:
+    if joint_endpoint_param == "endpoint":
+        return endpoint
+    if joint_endpoint_param == "mean_velocity":
+        start = current_pos_in_action_space(x_pos)
+        return (endpoint - start) / float(joint_endpoint_index + 1)
+    raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
+
+
+def endpoint_from_joint_endpoint_variable(
+    x_pos: torch.Tensor,
+    endpoint_variable: torch.Tensor,
+) -> torch.Tensor:
+    if joint_endpoint_param == "endpoint":
+        return endpoint_variable
+    if joint_endpoint_param == "mean_velocity":
+        start = current_pos_in_action_space(x_pos)
+        return start + float(joint_endpoint_index + 1) * endpoint_variable
+    raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
+
+
+def joint_line_from_endpoint_variable(
+    x_pos: torch.Tensor,
+    endpoint_variable: torch.Tensor,
+) -> torch.Tensor:
+    if joint_endpoint_param == "endpoint":
+        return endpoint_line_from_current_pos(x_pos, endpoint_variable)
+    if joint_endpoint_param == "mean_velocity":
+        start = current_pos_in_action_space(x_pos).unsqueeze(1)
+        steps = joint_step_weights(endpoint_variable.device, endpoint_variable.dtype)
+        return start + steps * endpoint_variable.unsqueeze(1)
+    raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
+
+
 def decompose_endpoint_residual(
     x_pos: torch.Tensor,
     x_traj: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     endpoint = x_traj[:, joint_endpoint_index, :]
-    coarse = endpoint_line_from_current_pos(x_pos, endpoint)
+    endpoint_variable = joint_endpoint_variable_from_endpoint(x_pos, endpoint)
+    coarse = joint_line_from_endpoint_variable(x_pos, endpoint_variable)
     residual = x_traj - coarse
-    return endpoint, residual[:, joint_residual_indices(), :], coarse
+    return endpoint_variable, residual[:, joint_residual_indices(), :], coarse
 
 
 def joint_residual_indices() -> list[int]:
@@ -295,6 +345,17 @@ def joint_residual_indices() -> list[int]:
 def compute_joint_residual_stats() -> tuple[np.ndarray, np.ndarray]:
     """Stats for residual prefix in normalized action coordinates."""
 
+    action_chunks, start_action = collect_action_chunks_and_starts()
+    endpoint = action_chunks[:, joint_endpoint_index, :]
+    endpoint_variable = endpoint_variable_from_endpoint_np(start_action[:, 0, :], endpoint)
+    coarse = joint_line_from_endpoint_variable_np(start_action, endpoint_variable)
+    residual_prefix = (action_chunks - coarse)[:, joint_residual_indices(), :]
+    return residual_prefix.mean(axis=0).astype(np.float32), _safe_std(
+        residual_prefix.std(axis=0),
+    )
+
+
+def collect_action_chunks_and_starts() -> tuple[np.ndarray, np.ndarray]:
     train_data = {
         "agent_pos": dataset.normalized_train_data["agent_pos"],
         "action": dataset.normalized_train_data["action"],
@@ -317,15 +378,46 @@ def compute_joint_residual_stats() -> tuple[np.ndarray, np.ndarray]:
     current_positions = np.asarray(current_positions, dtype=np.float32)
     current_raw = _unnormalize_np(current_positions, stats["agent_pos"])
     start_action = _normalize_np(current_raw, stats["action"])[:, None, :]
+    return action_chunks, start_action
+
+
+def endpoint_variable_from_endpoint_np(
+    start_action: np.ndarray,
+    endpoint: np.ndarray,
+) -> np.ndarray:
+    if joint_endpoint_param == "endpoint":
+        return endpoint
+    if joint_endpoint_param == "mean_velocity":
+        return (endpoint - start_action) / float(joint_endpoint_index + 1)
+    raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
+
+
+def joint_line_from_endpoint_variable_np(
+    start_action: np.ndarray,
+    endpoint_variable: np.ndarray,
+) -> np.ndarray:
+    if joint_endpoint_param == "endpoint":
+        endpoint = endpoint_variable[:, None, :]
+        alpha = (
+            np.arange(1, pred_horizon + 1, dtype=np.float32)
+            / float(joint_endpoint_index + 1)
+        )[None, :, None]
+        return (1.0 - alpha) * start_action + alpha * endpoint
+    if joint_endpoint_param == "mean_velocity":
+        steps = np.arange(1, pred_horizon + 1, dtype=np.float32)[None, :, None]
+        return start_action + steps * endpoint_variable[:, None, :]
+    raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
+
+
+def compute_joint_endpoint_variable_stats() -> tuple[np.ndarray, np.ndarray]:
+    action_chunks, start_action = collect_action_chunks_and_starts()
     endpoint = action_chunks[:, joint_endpoint_index : joint_endpoint_index + 1, :]
-    alpha = (
-        np.arange(1, pred_horizon + 1, dtype=np.float32)
-        / float(joint_endpoint_index + 1)
-    )[None, :, None]
-    coarse = (1.0 - alpha) * start_action + alpha * endpoint
-    residual_prefix = (action_chunks - coarse)[:, joint_residual_indices(), :]
-    return residual_prefix.mean(axis=0).astype(np.float32), _safe_std(
-        residual_prefix.std(axis=0),
+    endpoint_variable = endpoint_variable_from_endpoint_np(
+        start_action[:, 0, :],
+        endpoint[:, 0, :],
+    )
+    return endpoint_variable.mean(axis=0).astype(np.float32), _safe_std(
+        endpoint_variable.std(axis=0),
     )
 
 
@@ -333,6 +425,10 @@ joint_residual_mean_np = None
 joint_residual_std_np = None
 joint_residual_mean = None
 joint_residual_std = None
+joint_endpoint_mean_np = None
+joint_endpoint_std_np = None
+joint_endpoint_mean = None
+joint_endpoint_std = None
 if flow_base_mode == "joint_endpoint_residual" and joint_normalize_residual:
     joint_residual_mean_np, joint_residual_std_np = compute_joint_residual_stats()
     joint_residual_mean = torch.as_tensor(
@@ -352,6 +448,24 @@ if flow_base_mode == "joint_endpoint_residual" and joint_normalize_residual:
         f"std_min={joint_residual_std_np.min():.4f}, "
         f"std_max={joint_residual_std_np.max():.4f}"
     )
+if flow_base_mode == "joint_endpoint_residual" and joint_endpoint_param != "endpoint":
+    joint_endpoint_mean_np, joint_endpoint_std_np = compute_joint_endpoint_variable_stats()
+    joint_endpoint_mean = torch.as_tensor(
+        joint_endpoint_mean_np,
+        device=device,
+        dtype=torch.float32,
+    )
+    joint_endpoint_std = torch.as_tensor(
+        joint_endpoint_std_np,
+        device=device,
+        dtype=torch.float32,
+    )
+    print(
+        "Joint endpoint variable stats: "
+        f"param={joint_endpoint_param}, "
+        f"mean={joint_endpoint_mean_np.tolist()}, "
+        f"std={joint_endpoint_std_np.tolist()}"
+    )
 
 
 def normalize_residual_prefix(residual_prefix: torch.Tensor) -> torch.Tensor:
@@ -368,6 +482,22 @@ def denormalize_residual_prefix(residual_prefix: torch.Tensor) -> torch.Tensor:
     mean = joint_residual_mean.to(device=residual_prefix.device, dtype=residual_prefix.dtype)
     std = joint_residual_std.to(device=residual_prefix.device, dtype=residual_prefix.dtype)
     return residual_prefix * std + mean
+
+
+def normalize_endpoint_variable(endpoint_variable: torch.Tensor) -> torch.Tensor:
+    if joint_endpoint_param == "endpoint":
+        return endpoint_variable
+    mean = joint_endpoint_mean.to(device=endpoint_variable.device, dtype=endpoint_variable.dtype)
+    std = joint_endpoint_std.to(device=endpoint_variable.device, dtype=endpoint_variable.dtype)
+    return (endpoint_variable - mean) / std
+
+
+def denormalize_endpoint_variable(endpoint_variable: torch.Tensor) -> torch.Tensor:
+    if joint_endpoint_param == "endpoint":
+        return endpoint_variable
+    mean = joint_endpoint_mean.to(device=endpoint_variable.device, dtype=endpoint_variable.dtype)
+    std = joint_endpoint_std.to(device=endpoint_variable.device, dtype=endpoint_variable.dtype)
+    return endpoint_variable * std + mean
 
 
 def sample_flow_timestep(batch_size: int, ref: torch.Tensor) -> torch.Tensor:
@@ -406,20 +536,21 @@ def compute_joint_endpoint_residual_loss(
     obs_cond: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = x_traj.shape[0]
-    endpoint, residual_prefix, _ = decompose_endpoint_residual(x_pos, x_traj)
+    endpoint_variable, residual_prefix, _ = decompose_endpoint_residual(x_pos, x_traj)
+    endpoint_variable = normalize_endpoint_variable(endpoint_variable)
     residual_prefix = normalize_residual_prefix(residual_prefix)
 
-    endpoint_noise = torch.randn_like(endpoint)
+    endpoint_noise = torch.randn_like(endpoint_variable)
     residual_noise = torch.randn_like(residual_prefix)
     timestep = sample_flow_timestep(batch_size, x_traj)
     t_endpoint = timestep.view(batch_size, 1)
     t_residual = timestep.view(batch_size, 1, 1)
 
-    endpoint_t = (1.0 - t_endpoint) * endpoint_noise + t_endpoint * endpoint
+    endpoint_t = (1.0 - t_endpoint) * endpoint_noise + t_endpoint * endpoint_variable
     residual_t = (1.0 - t_residual) * residual_noise + t_residual * residual_prefix
     model_input = pack_joint_tokens(endpoint_t, residual_t)
 
-    target_endpoint_v = endpoint - endpoint_noise
+    target_endpoint_v = endpoint_variable - endpoint_noise
     target_residual_v = residual_prefix - residual_noise
     pred_v = predict_velocity(nets, model_input, timestep, obs_cond)
     pred_endpoint_v, pred_residual_v = unpack_joint_velocity(pred_v)
@@ -544,7 +675,8 @@ def sample_joint_endpoint_residual_actions(
 
     residual = torch.zeros(batch_size, pred_horizon, action_dim, device=device)
     residual[:, joint_residual_indices(), :] = denormalize_residual_prefix(residual_prefix)
-    return endpoint_line_from_current_pos(x_pos, endpoint) + residual
+    endpoint_variable_action = denormalize_endpoint_variable(endpoint)
+    return joint_line_from_endpoint_variable(x_pos, endpoint_variable_action) + residual
 
 
 def sample_actions(nets_to_use: nn.ModuleDict, obs_cond: torch.Tensor, x_pos: torch.Tensor) -> torch.Tensor:
@@ -737,6 +869,7 @@ def train():
             f"max_train_batches={max_train_batches}, "
             f"torch_compile={compile_model}, "
             f"joint_normalize_residual={joint_normalize_residual}, "
+            f"joint_endpoint_param={joint_endpoint_param}, "
             f"joint_endpoint_index={joint_endpoint_index}, "
             f"joint_endpoint_token_position={joint_endpoint_token_position}, "
             f"joint_loss_mode={joint_loss_mode}, "
@@ -907,9 +1040,12 @@ def train():
                             nets.token_type_embedding,
                         ) if use_token_embeddings and token_type_embed_dim > 0 else None,
                         'joint_normalize_residual': joint_normalize_residual,
+                        'joint_endpoint_param': joint_endpoint_param,
                         'joint_endpoint_index': joint_endpoint_index,
                         'joint_endpoint_token_position': joint_endpoint_token_position,
                         'joint_loss_mode': joint_loss_mode,
+                        'joint_endpoint_mean': joint_endpoint_mean_np,
+                        'joint_endpoint_std': joint_endpoint_std_np,
                         'joint_residual_mean': joint_residual_mean_np,
                         'joint_residual_std': joint_residual_std_np,
                         }, PATH)
@@ -953,6 +1089,7 @@ def init_wandb_for_train(train_config: dict[str, object]):
             "checkpoint_dir": checkpoint_dir,
             "checkpoint_every_epochs": checkpoint_every_epochs,
             "joint_normalize_residual": joint_normalize_residual,
+            "joint_endpoint_param": joint_endpoint_param,
             "joint_endpoint_index": joint_endpoint_index,
             "joint_endpoint_token_position": joint_endpoint_token_position,
             "joint_loss_mode": joint_loss_mode,
@@ -1012,6 +1149,7 @@ def init_wandb_for_test(checkpoint_path: str, test_config: dict[str, object]):
             "flow_base_mode": flow_base_mode,
             "flow_num_steps": flow_num_steps,
             "flow_timestep_distribution": flow_timestep_distribution,
+            "joint_endpoint_param": joint_endpoint_param,
             "joint_endpoint_index": joint_endpoint_index,
             "joint_endpoint_token_position": joint_endpoint_token_position,
             "joint_loss_mode": joint_loss_mode,
@@ -1240,8 +1378,13 @@ def run_push_t_rollouts(
 def test():
     global flow_base_mode
     global flow_num_steps
+    global joint_endpoint_param
     global joint_endpoint_index
     global joint_endpoint_token_position
+    global joint_endpoint_mean_np
+    global joint_endpoint_std_np
+    global joint_endpoint_mean
+    global joint_endpoint_std
     global joint_residual_mean_np
     global joint_residual_std_np
     global joint_residual_mean
@@ -1340,6 +1483,16 @@ def test():
                 )
             )
     if checkpoint_mode == "joint_endpoint_residual":
+        checkpoint_endpoint_param = state_dict.get("joint_endpoint_param", "endpoint")
+        if checkpoint_endpoint_param != joint_endpoint_param:
+            print(
+                colored(
+                    f"using checkpoint joint_endpoint_param={checkpoint_endpoint_param} "
+                    f"instead of current JOINT_ENDPOINT_PARAM={joint_endpoint_param}",
+                    "yellow",
+                )
+            )
+            joint_endpoint_param = checkpoint_endpoint_param
         checkpoint_endpoint_index = state_dict.get("joint_endpoint_index")
         if checkpoint_endpoint_index is None:
             checkpoint_endpoint_index = pred_horizon - 1
@@ -1379,6 +1532,38 @@ def test():
                 )
             )
             joint_endpoint_token_position = checkpoint_token_position
+        if state_dict.get("joint_endpoint_mean") is not None:
+            joint_endpoint_mean_np = np.asarray(
+                state_dict["joint_endpoint_mean"],
+                dtype=np.float32,
+            )
+        if state_dict.get("joint_endpoint_std") is not None:
+            joint_endpoint_std_np = np.asarray(
+                state_dict["joint_endpoint_std"],
+                dtype=np.float32,
+            )
+        if joint_endpoint_param != "endpoint":
+            if joint_endpoint_mean_np is None or joint_endpoint_std_np is None:
+                print(
+                    colored(
+                        "warning: joint checkpoint has no endpoint variable stats; "
+                        "recomputing them from the current dataset",
+                        "yellow",
+                    )
+                )
+                joint_endpoint_mean_np, joint_endpoint_std_np = (
+                    compute_joint_endpoint_variable_stats()
+                )
+            joint_endpoint_mean = torch.as_tensor(
+                joint_endpoint_mean_np,
+                device=device,
+                dtype=torch.float32,
+            )
+            joint_endpoint_std = torch.as_tensor(
+                joint_endpoint_std_np,
+                device=device,
+                dtype=torch.float32,
+            )
         if state_dict.get("joint_residual_mean") is not None:
             joint_residual_mean_np = np.asarray(
                 state_dict["joint_residual_mean"],
