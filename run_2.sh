@@ -7,6 +7,10 @@ echo "Started at $(date)"
 echo "Node: $(hostname)"
 echo "Workdir: $(pwd)"
 
+set -a
+source /workspace/Openarm-GR00T/train_on_dgx/secrets/secrets.env
+set +a
+
 export SEED="${SEED:-42}"
 export DATALOADER_SEED="${DATALOADER_SEED:-$SEED}"
 export TRAIN_ROLLOUT_POLICY_SEED="${TRAIN_ROLLOUT_POLICY_SEED:-2000}"

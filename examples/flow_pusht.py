@@ -130,6 +130,7 @@ token_local_cond_dim = (
     else 0
 )
 flow_base_mode = os.environ.get("FLOW_BASE_MODE", "pure_noise")
+relative_action_space = env_flag("RELATIVE_ACTION_SPACE", False)
 flow_num_steps = int(os.environ.get("FLOW_NUM_STEPS", "1"))
 flow_timestep_distribution = os.environ.get("FLOW_TIMESTEP_DISTRIBUTION", "uniform")
 endpoint_loss_weight = float(os.environ.get("ENDPOINT_LOSS_WEIGHT", "1.0"))
@@ -205,6 +206,8 @@ if policy_backbone not in ("unet", "transformer"):
     raise ValueError("POLICY_BACKBONE must be unet or transformer")
 if flow_base_mode not in ("pure_noise", "joint_endpoint_residual"):
     raise ValueError("FLOW_BASE_MODE must be pure_noise or joint_endpoint_residual")
+if relative_action_space and flow_base_mode != "pure_noise":
+    raise ValueError("RELATIVE_ACTION_SPACE applies only to FLOW_BASE_MODE=pure_noise")
 if flow_timestep_distribution not in ("uniform", "beta"):
     raise ValueError("FLOW_TIMESTEP_DISTRIBUTION must be uniform or beta")
 if joint_loss_mode not in ("token_mean", "separate"):
@@ -377,11 +380,15 @@ def _minmax_denormalize_torch(
     return ((data + 1.0) / 2.0) * value_range + min_value
 
 
+def current_pos_raw(x_pos: torch.Tensor) -> torch.Tensor:
+    latest_pos = x_pos[:, obs_horizon - 1, :]
+    return _unnormalize_torch(latest_pos, "agent_pos")
+
+
 def current_pos_in_action_space(x_pos: torch.Tensor) -> torch.Tensor:
     """Convert normalized agent_pos into the configured joint variable coordinates."""
 
-    latest_pos = x_pos[:, obs_horizon - 1, :]
-    raw_pos = _unnormalize_torch(latest_pos, "agent_pos")
+    raw_pos = current_pos_raw(x_pos)
     if joint_variable_space == "raw_action":
         return raw_pos
     return _normalize_torch(raw_pos, "action")
@@ -701,7 +708,13 @@ def compute_joint_residual_stats() -> tuple[np.ndarray, np.ndarray, np.ndarray, 
     return _mean_std_min_max_np(residual_variable)
 
 
-def collect_action_chunks_and_starts() -> tuple[np.ndarray, np.ndarray]:
+def collect_action_chunks_and_starts(
+    *,
+    variable_space: str | None = None,
+    coarse_origin: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    variable_space = variable_space or joint_variable_space
+    coarse_origin = coarse_origin or joint_coarse_origin
     train_data = {
         "agent_pos": dataset.normalized_train_data["agent_pos"],
         "action": dataset.normalized_train_data["action"],
@@ -727,18 +740,27 @@ def collect_action_chunks_and_starts() -> tuple[np.ndarray, np.ndarray]:
     current_positions = np.asarray(current_positions, dtype=np.float32)
     previous_actions = np.asarray(previous_actions, dtype=np.float32)
     current_raw = _unnormalize_np(current_positions, stats["agent_pos"])
-    if joint_variable_space == "raw_action":
+    if variable_space == "raw_action":
         action_chunks = _unnormalize_np(action_chunks, stats["action"])
-        if joint_coarse_origin == "previous_action":
+        if coarse_origin == "previous_action":
             start_action = _unnormalize_np(previous_actions, stats["action"])[:, None, :]
         else:
             start_action = current_raw[:, None, :]
     else:
-        if joint_coarse_origin == "previous_action":
+        if coarse_origin == "previous_action":
             start_action = previous_actions[:, None, :]
         else:
             start_action = _normalize_np(current_raw, stats["action"])[:, None, :]
     return action_chunks, start_action
+
+
+def compute_relative_action_stats() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    action_chunks, current_positions = collect_action_chunks_and_starts(
+        variable_space="raw_action",
+        coarse_origin="state",
+    )
+    relative_actions = (action_chunks - current_positions).reshape(-1, action_dim)
+    return _mean_std_min_max_np(relative_actions)
 
 
 def endpoint_variable_from_endpoint_np(
@@ -921,8 +943,19 @@ class JointVariableStats:
         return tensor.to(device=ref.device, dtype=ref.dtype)
 
 
+relative_action_stats = JointVariableStats()
 joint_residual_stats = JointVariableStats()
 joint_endpoint_stats = JointVariableStats()
+if flow_base_mode == "pure_noise" and relative_action_space:
+    relative_action_stats = JointVariableStats.from_values(
+        compute_relative_action_stats(),
+        add_batch_dim=False,
+    )
+    print(
+        "Relative action stats: "
+        f"min={relative_action_stats.min_np.tolist()}, "
+        f"max={relative_action_stats.max_np.tolist()}"
+    )
 if flow_base_mode == "joint_endpoint_residual" and joint_normalize_residual:
     joint_residual_stats = JointVariableStats.from_values(
         compute_joint_residual_stats(),
@@ -980,6 +1013,28 @@ def denormalize_endpoint_variable(endpoint_variable: torch.Tensor) -> torch.Tens
     return joint_endpoint_stats.denormalize(endpoint_variable, joint_variable_norm)
 
 
+def action_to_pure_flow_space(
+    x_pos: torch.Tensor,
+    x_traj: torch.Tensor,
+) -> torch.Tensor:
+    if not relative_action_space:
+        return x_traj
+    action_raw = _unnormalize_torch(x_traj, "action")
+    relative_raw = action_raw - current_pos_raw(x_pos).unsqueeze(1)
+    return relative_action_stats.normalize(relative_raw, "minmax")
+
+
+def pure_flow_space_to_normalized_action(
+    x_pos: torch.Tensor,
+    x_traj: torch.Tensor,
+) -> torch.Tensor:
+    if not relative_action_space:
+        return x_traj
+    relative_raw = relative_action_stats.denormalize(x_traj, "minmax")
+    action_raw = current_pos_raw(x_pos).unsqueeze(1) + relative_raw
+    return _normalize_torch(action_raw, "action")
+
+
 def sample_flow_timestep(batch_size: int, ref: torch.Tensor) -> torch.Tensor:
     if flow_timestep_distribution == "uniform":
         return torch.rand(batch_size, device=ref.device, dtype=ref.dtype)
@@ -1009,7 +1064,12 @@ def encode_observation(
     return obs_features.flatten(start_dim=1)
 
 
-def compute_pure_flow_loss(x_traj: torch.Tensor, obs_cond: torch.Tensor) -> torch.Tensor:
+def compute_pure_flow_loss(
+    x_pos: torch.Tensor,
+    x_traj: torch.Tensor,
+    obs_cond: torch.Tensor,
+) -> torch.Tensor:
+    x_traj = action_to_pure_flow_space(x_pos, x_traj)
     batch_size = x_traj.shape[0]
     x0 = torch.randn_like(x_traj)
     timestep = sample_flow_timestep(batch_size, x_traj)
@@ -1145,10 +1205,11 @@ def predict_velocity(
 def sample_pure_flow_actions(
     nets_to_use: nn.ModuleDict,
     obs_cond: torch.Tensor,
-    batch_size: int,
+    x_pos: torch.Tensor,
     *,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
+    batch_size = x_pos.shape[0]
     traj = torch.randn(
         batch_size,
         pred_horizon,
@@ -1161,7 +1222,7 @@ def sample_pure_flow_actions(
         timestep = torch.full((batch_size,), i * dt, device=device)
         vt = predict_velocity(nets_to_use, traj, timestep, obs_cond)
         traj = traj + dt * vt
-    return traj
+    return pure_flow_space_to_normalized_action(x_pos, traj)
 
 
 def sample_joint_endpoint_residual_actions(
@@ -1230,7 +1291,7 @@ def sample_actions(
     return sample_pure_flow_actions(
         nets_to_use,
         obs_cond,
-        x_pos.shape[0],
+        x_pos,
         generator=generator,
     )
 
@@ -1379,6 +1440,11 @@ def train():
         os.environ.get("WANDB_TRAIN_ROLLOUT_EVERY_EPOCHS", "0"),
     ))
     train_rollout_episodes = int(os.environ.get("TRAIN_ROLLOUT_EPISODES", "4"))
+    train_rollout_repeats_per_env = int(
+        os.environ.get("TRAIN_ROLLOUT_REPEATS_PER_ENV", "1")
+    )
+    if train_rollout_repeats_per_env < 1:
+        raise ValueError("TRAIN_ROLLOUT_REPEATS_PER_ENV must be at least 1")
     train_rollout_video_episodes = int(os.environ.get(
         "TRAIN_ROLLOUT_VIDEO_EPISODES",
         os.environ.get("WANDB_TRAIN_VIDEO_EPISODES", "2"),
@@ -1395,6 +1461,7 @@ def train():
     wandb_run = init_wandb_for_train({
         "train_rollout_every_epochs": train_rollout_every_epochs,
         "train_rollout_episodes": train_rollout_episodes,
+        "train_rollout_repeats_per_env": train_rollout_repeats_per_env,
         "train_rollout_video_episodes": train_rollout_video_episodes,
         "train_rollout_max_steps": train_rollout_max_steps,
         "train_rollout_start_seed": train_rollout_start_seed,
@@ -1408,6 +1475,7 @@ def train():
             "Training config: "
             f"policy_backbone={policy_backbone}, "
             f"flow_base_mode={flow_base_mode}, "
+            f"relative_action_space={relative_action_space}, "
             f"flow_num_steps={flow_num_steps}, "
             f"flow_timestep_distribution={flow_timestep_distribution}, "
             f"obs_horizon={obs_horizon}, "
@@ -1444,6 +1512,7 @@ def train():
             f"transformer_n_head={transformer_n_head}, "
             f"transformer_n_emb={transformer_n_emb}, "
             f"train_rollout_every_epochs={train_rollout_every_epochs}, "
+            f"train_rollout_repeats_per_env={train_rollout_repeats_per_env}, "
             f"seed={seed}, "
             f"dataloader_seed={dataloader_seed}, "
             f"train_rollout_policy_seed={train_rollout_policy_seed}",
@@ -1485,7 +1554,7 @@ def train():
                     total_endpoint_loss += endpoint_loss
                     total_residual_loss += residual_loss
                 else:
-                    loss = compute_pure_flow_loss(x_traj, obs_cond)
+                    loss = compute_pure_flow_loss(x_pos, x_traj, obs_cond)
             total_loss_train += loss.detach()
 
             if scaler.is_enabled():
@@ -1547,14 +1616,18 @@ def train():
                 rollout_start_seed = train_rollout_start_seed
                 rollout_policy_seed = train_rollout_policy_seed
                 if not train_rollout_fixed_seeds:
-                    rollout_seed_offset = epoch * train_rollout_episodes
-                    rollout_start_seed += rollout_seed_offset
-                    rollout_policy_seed += rollout_seed_offset
+                    rollout_start_seed += epoch * train_rollout_episodes
+                    rollout_policy_seed += (
+                        epoch
+                        * train_rollout_episodes
+                        * train_rollout_repeats_per_env
+                    )
                 rollout_metrics, rollout_rows, rollout_videos = run_push_t_rollouts(
                     nets,
                     start_seed=rollout_start_seed,
                     policy_seed_start=rollout_policy_seed,
                     n_episodes=train_rollout_episodes,
+                    repeats_per_env=train_rollout_repeats_per_env,
                     max_steps=train_rollout_max_steps,
                     video_episodes=train_rollout_video_episodes,
                     video_fps=train_rollout_video_fps,
@@ -1599,6 +1672,7 @@ def train():
                         'noise_pred_net': module_state_dict_for_checkpoint(nets.noise_pred_net),
                         'policy_backbone': policy_backbone,
                         'flow_base_mode': flow_base_mode,
+                        'relative_action_space': relative_action_space,
                         'flow_num_steps': flow_num_steps,
                         'flow_timestep_distribution': flow_timestep_distribution,
                         'seed': seed,
@@ -1639,6 +1713,7 @@ def train():
                         'joint_mean_velocity_coarse_mode': joint_mean_velocity_coarse_mode,
                         'joint_endpoint_token_position': joint_endpoint_token_position,
                         'joint_loss_mode': joint_loss_mode,
+                        **relative_action_stats.checkpoint_items("relative_action"),
                         **joint_endpoint_stats.checkpoint_items("joint_endpoint"),
                         **joint_residual_stats.checkpoint_items("joint_residual"),
                         }, PATH)
@@ -1669,6 +1744,7 @@ def init_wandb_for_train(train_config: dict[str, object]):
             "dataset_path": dataset_path,
             "policy_backbone": policy_backbone,
             "flow_base_mode": flow_base_mode,
+            "relative_action_space": relative_action_space,
             "flow_num_steps": flow_num_steps,
             "flow_timestep_distribution": flow_timestep_distribution,
             "seed": seed,
@@ -1754,6 +1830,7 @@ def init_wandb_for_test(checkpoint_path: str, test_config: dict[str, object]):
             "checkpoint": checkpoint_path,
             "policy_backbone": policy_backbone,
             "flow_base_mode": flow_base_mode,
+            "relative_action_space": relative_action_space,
             "flow_num_steps": flow_num_steps,
             "flow_timestep_distribution": flow_timestep_distribution,
             "seed": seed,
@@ -1842,6 +1919,7 @@ def run_push_t_rollouts(
     start_seed: int,
     policy_seed_start: int,
     n_episodes: int,
+    repeats_per_env: int,
     max_steps: int,
     video_episodes: int,
     video_fps: int,
@@ -1858,127 +1936,140 @@ def run_push_t_rollouts(
     videos = {}
 
     try:
-        for episode_index in range(n_episodes):
-            seed = start_seed + episode_index
-            policy_seed = policy_seed_start + episode_index
-            policy_generator = make_policy_generator(policy_seed)
-            env.seed(seed)
-            obs, info = env.reset()
-            obs_deque = collections.deque([obs] * obs_horizon, maxlen=obs_horizon)
-            initial_previous_action = np.asarray(obs['agent_pos'], dtype=np.float32)
-            previous_action_deque = collections.deque(
-                [initial_previous_action] * obs_horizon,
-                maxlen=obs_horizon,
-            )
-            should_record_video = episode_index < video_episodes
-            imgs = [env.render(mode='rgb_array')] if should_record_video else []
-            rewards = []
-            episode_inference_times_ms = []
-            done = False
-            step_idx = 0
+        for environment_index in range(n_episodes):
+            seed = start_seed + environment_index
+            for repeat_index in range(repeats_per_env):
+                episode_index = environment_index * repeats_per_env + repeat_index
+                policy_seed = policy_seed_start + episode_index
+                policy_generator = make_policy_generator(policy_seed)
+                env.seed(seed)
+                obs, info = env.reset()
+                obs_deque = collections.deque([obs] * obs_horizon, maxlen=obs_horizon)
+                initial_previous_action = np.asarray(obs['agent_pos'], dtype=np.float32)
+                previous_action_deque = collections.deque(
+                    [initial_previous_action] * obs_horizon,
+                    maxlen=obs_horizon,
+                )
+                should_record_video = (
+                    repeat_index == 0 and environment_index < video_episodes
+                )
+                imgs = [env.render(mode='rgb_array')] if should_record_video else []
+                rewards = []
+                episode_inference_times_ms = []
+                done = False
+                step_idx = 0
 
-            with tqdm(
-                total=max_steps,
-                desc=f"{desc_prefix} seed={seed}",
-                disable=not show_progress,
-            ) as pbar:
-                while not done:
-                    x_img = np.stack([x['image'] for x in obs_deque])
-                    x_pos = np.stack([x['agent_pos'] for x in obs_deque])
-                    x_previous_action = np.stack(previous_action_deque)
-                    x_pos = pusht.normalize_data(x_pos, stats=stats['agent_pos'])
-                    x_previous_action = pusht.normalize_data(
-                        x_previous_action,
-                        stats=stats['action'],
-                    )
-
-                    x_img = torch.from_numpy(x_img).to(device, dtype=torch.float32)
-                    x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.float32)
-                    x_previous_action = torch.from_numpy(x_previous_action).to(
-                        device,
-                        dtype=torch.float32,
-                    )
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
-                    inference_start = time.perf_counter()
-                    with torch.inference_mode(), autocast_context():
-                        obs_cond = encode_observation(
-                            nets_to_use,
-                            x_img.unsqueeze(0),
-                            x_pos.unsqueeze(0),
-                            x_previous_action.unsqueeze(0),
+                with tqdm(
+                    total=max_steps,
+                    desc=(
+                        f"{desc_prefix} seed={seed} "
+                        f"repeat={repeat_index + 1}/{repeats_per_env}"
+                    ),
+                    disable=not show_progress,
+                ) as pbar:
+                    while not done:
+                        x_img = np.stack([x['image'] for x in obs_deque])
+                        x_pos = np.stack([x['agent_pos'] for x in obs_deque])
+                        x_previous_action = np.stack(previous_action_deque)
+                        x_pos = pusht.normalize_data(x_pos, stats=stats['agent_pos'])
+                        x_previous_action = pusht.normalize_data(
+                            x_previous_action,
+                            stats=stats['action'],
                         )
-                        traj = sample_actions(
-                            nets_to_use,
-                            obs_cond,
-                            x_pos.unsqueeze(0),
-                            x_previous_action.unsqueeze(0),
-                            generator=policy_generator,
+
+                        x_img = torch.from_numpy(x_img).to(device, dtype=torch.float32)
+                        x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.float32)
+                        x_previous_action = torch.from_numpy(x_previous_action).to(
+                            device,
+                            dtype=torch.float32,
                         )
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
-                    inference_ms = (time.perf_counter() - inference_start) * 1000.0
-                    inference_times_ms.append(inference_ms)
-                    episode_inference_times_ms.append(inference_ms)
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                        inference_start = time.perf_counter()
+                        with torch.inference_mode(), autocast_context():
+                            obs_cond = encode_observation(
+                                nets_to_use,
+                                x_img.unsqueeze(0),
+                                x_pos.unsqueeze(0),
+                                x_previous_action.unsqueeze(0),
+                            )
+                            traj = sample_actions(
+                                nets_to_use,
+                                obs_cond,
+                                x_pos.unsqueeze(0),
+                                x_previous_action.unsqueeze(0),
+                                generator=policy_generator,
+                            )
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                        inference_ms = (time.perf_counter() - inference_start) * 1000.0
+                        inference_times_ms.append(inference_ms)
+                        episode_inference_times_ms.append(inference_ms)
 
-                    naction = traj.detach().float().to('cpu').numpy()[0]
-                    action_pred = pusht.unnormalize_data(naction, stats=stats['action'])
-                    start = obs_horizon - 1
-                    end = start + action_horizon
-                    action = action_pred[start:end, :]
+                        naction = traj.detach().float().to('cpu').numpy()[0]
+                        action_pred = pusht.unnormalize_data(naction, stats=stats['action'])
+                        start = obs_horizon - 1
+                        end = start + action_horizon
+                        action = action_pred[start:end, :]
 
-                    for j in range(len(action)):
-                        obs, reward, done, _, info = env.step(action[j])
-                        obs_deque.append(obs)
-                        previous_action_deque.append(
-                            np.asarray(action[j], dtype=np.float32)
-                        )
-                        rewards.append(reward)
-                        if should_record_video:
-                            imgs.append(env.render(mode='rgb_array'))
-                        step_idx += 1
-                        pbar.update(1)
-                        pbar.set_postfix(reward=reward)
-                        if step_idx >= max_steps:
-                            done = True
-                        if done:
-                            break
+                        for j in range(len(action)):
+                            obs, reward, done, _, info = env.step(action[j])
+                            obs_deque.append(obs)
+                            previous_action_deque.append(
+                                np.asarray(action[j], dtype=np.float32)
+                            )
+                            rewards.append(reward)
+                            if should_record_video:
+                                imgs.append(env.render(mode='rgb_array'))
+                            step_idx += 1
+                            pbar.update(1)
+                            pbar.set_postfix(reward=reward)
+                            if step_idx >= max_steps:
+                                done = True
+                            if done:
+                                break
 
-            if len(rewards) == 0:
-                continue
+                if len(rewards) == 0:
+                    continue
 
-            rewards_np = np.asarray(rewards, dtype=np.float32)
-            episode_max_reward = float(np.max(rewards_np))
-            episode_final_reward = float(rewards_np[-1])
-            episode_mean_reward = float(np.mean(rewards_np))
-            max_rewards.append(episode_max_reward)
-            final_rewards.append(episode_final_reward)
-            mean_step_rewards.append(episode_mean_reward)
-            episode_row = {
-                f"{metric_prefix}/episode_index": episode_index,
-                f"{metric_prefix}/episode_seed": seed,
-                f"{metric_prefix}/episode_policy_seed": policy_seed,
-                f"{metric_prefix}/episode_steps": len(rewards),
-                f"{metric_prefix}/episode_max_reward": episode_max_reward,
-                f"{metric_prefix}/episode_final_reward": episode_final_reward,
-                f"{metric_prefix}/episode_mean_step_reward": episode_mean_reward,
-                f"{metric_prefix}/episode_inference_time_ms_mean": (
-                    float(np.mean(episode_inference_times_ms))
-                    if episode_inference_times_ms
-                    else 0.0
-                ),
-            }
-            episode_rows.append(episode_row)
-            if should_record_video:
-                video = make_wandb_video(imgs, fps=video_fps)
-                if video is not None:
-                    videos[f"{metric_prefix}/rollout_{episode_index:03d}"] = video
+                rewards_np = np.asarray(rewards, dtype=np.float32)
+                episode_max_reward = float(np.max(rewards_np))
+                episode_final_reward = float(rewards_np[-1])
+                episode_mean_reward = float(np.mean(rewards_np))
+                max_rewards.append(episode_max_reward)
+                final_rewards.append(episode_final_reward)
+                mean_step_rewards.append(episode_mean_reward)
+                episode_row = {
+                    f"{metric_prefix}/episode_index": episode_index,
+                    f"{metric_prefix}/environment_index": environment_index,
+                    f"{metric_prefix}/environment_repeat": repeat_index + 1,
+                    f"{metric_prefix}/episode_seed": seed,
+                    f"{metric_prefix}/episode_policy_seed": policy_seed,
+                    f"{metric_prefix}/episode_steps": len(rewards),
+                    f"{metric_prefix}/episode_max_reward": episode_max_reward,
+                    f"{metric_prefix}/episode_final_reward": episode_final_reward,
+                    f"{metric_prefix}/episode_mean_step_reward": episode_mean_reward,
+                    f"{metric_prefix}/episode_inference_time_ms_mean": (
+                        float(np.mean(episode_inference_times_ms))
+                        if episode_inference_times_ms
+                        else 0.0
+                    ),
+                }
+                episode_rows.append(episode_row)
+                if should_record_video:
+                    video = make_wandb_video(imgs, fps=video_fps)
+                    if video is not None:
+                        videos[
+                            f"{metric_prefix}/rollout_env_{environment_index:03d}"
+                        ] = video
     finally:
         env.close()
 
     if len(max_rewards) == 0:
         metrics = {
             f"{metric_prefix}/n_episodes": 0,
+            f"{metric_prefix}/n_environments": n_episodes,
+            f"{metric_prefix}/repeats_per_environment": repeats_per_env,
             f"{metric_prefix}/avg_max_reward": 0.0,
             f"{metric_prefix}/success_rate_0.90": 0.0,
             f"{metric_prefix}/success_rate_0.95": 0.0,
@@ -2002,6 +2093,8 @@ def run_push_t_rollouts(
         f"{metric_prefix}/zero_max_reward_rate": float((max_rewards_np <= 1e-6).mean()),
         f"{metric_prefix}/zero_final_reward_rate": float((final_rewards_np <= 1e-6).mean()),
         f"{metric_prefix}/n_episodes": len(max_rewards),
+        f"{metric_prefix}/n_environments": n_episodes,
+        f"{metric_prefix}/repeats_per_environment": repeats_per_env,
         f"{metric_prefix}/max_reward_std": float(max_rewards_np.std()),
         f"{metric_prefix}/inference_time_ms_mean": (
             float(inference_times_ms_np.mean())
@@ -2021,6 +2114,7 @@ def run_push_t_rollouts(
 ###### test the model
 def test():
     global flow_base_mode
+    global relative_action_space
     global flow_num_steps
     global joint_endpoint_param
     global joint_coarse_origin
@@ -2034,6 +2128,7 @@ def test():
     global joint_endpoint_token_position
     global joint_endpoint_stats
     global joint_residual_stats
+    global relative_action_stats
 
     PATH = os.environ.get("PUSHT_CHECKPOINT", "./checkpoint_t/flow_ema_03000.pth")
     state_dict = torch.load(PATH, map_location=device, weights_only=False)
@@ -2108,6 +2203,38 @@ def test():
             )
         )
         flow_base_mode = checkpoint_mode
+    checkpoint_relative_action_space = bool(
+        state_dict.get("relative_action_space", False)
+    )
+    if checkpoint_relative_action_space != relative_action_space:
+        print(
+            colored(
+                "using checkpoint relative_action_space="
+                f"{checkpoint_relative_action_space} instead of current "
+                f"RELATIVE_ACTION_SPACE={relative_action_space}",
+                "yellow",
+            )
+        )
+        relative_action_space = checkpoint_relative_action_space
+    relative_action_stats = JointVariableStats.from_checkpoint(
+        state_dict,
+        "relative_action",
+    )
+    if relative_action_space:
+        if relative_action_stats.missing_for_norm("minmax"):
+            print(
+                colored(
+                    "warning: relative-action checkpoint has no stats; "
+                    "recomputing them from the current dataset",
+                    "yellow",
+                )
+            )
+            relative_action_stats = JointVariableStats.from_values(
+                compute_relative_action_stats(),
+                add_batch_dim=False,
+            )
+        else:
+            relative_action_stats.attach_tensors(add_batch_dim=False)
     checkpoint_flow_num_steps = state_dict.get("flow_num_steps")
     if checkpoint_flow_num_steps is not None:
         checkpoint_flow_num_steps = int(checkpoint_flow_num_steps)
