@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+echo "Started at $(date)"
+echo "Node: $(hostname)"
+echo "Workdir: $(pwd)"
+
+export SEED="${SEED:-42}"
+export DATALOADER_SEED="${DATALOADER_SEED:-$SEED}"
+export TRAIN_ROLLOUT_POLICY_SEED="${TRAIN_ROLLOUT_POLICY_SEED:-2000}"
+export TEST_POLICY_SEED="${TEST_POLICY_SEED:-2000}"
+export PYTHONHASHSEED="$SEED"
+
+export FLOW_TIME_SCALE=1
+
+export OBS_HORIZON=1
+export UNET_DOWN_DIMS=256,512,1024
+export UNET_DIFFUSION_STEP_EMBED_DIM=256
+export BATCH_SIZE=256
+export NUM_WORKERS=8
+
+# Three near-to-far, piecewise-linear t segments. Token counts must total
+# PRED_HORIZON; segment 3 may be -1 to consume the remainder.
+export ROLLING_SEGMENT1_TOKENS=3
+export ROLLING_SEGMENT1_T_START=0.9
+export ROLLING_SEGMENT1_T_END=0.9
+# The per-segment TRAIN_TRANSITION flags are also used by rollout.
+export ROLLING_SEGMENT1_TRAIN_TRANSITION=0
+export ROLLING_SEGMENT1_TRANSITION_ADVANCE=0
+
+export ROLLING_SEGMENT2_TOKENS=10
+export ROLLING_SEGMENT2_T_START=0.8
+export ROLLING_SEGMENT2_T_END=0.5
+export ROLLING_SEGMENT2_TRAIN_TRANSITION=1
+export ROLLING_SEGMENT2_TRANSITION_ADVANCE=0.2
+
+export ROLLING_SEGMENT3_TOKENS=3
+export ROLLING_SEGMENT3_T_START=0.4
+export ROLLING_SEGMENT3_T_END=0.01
+export ROLLING_SEGMENT3_TRAIN_TRANSITION=0
+export ROLLING_SEGMENT3_TRANSITION_ADVANCE=0.0
+
+export ROLLING_LAMBDA_RANDOM_PROB=0
+export ROLLING_TRAIN_TRANSITION_PROB=1.0
+export ROLLING_RELATIVE_ACTION_SPACE=1
+# symmetric_beta requires ROLLING_RELATIVE_ACTION_SPACE=1.
+export ROLLING_RELATIVE_NOISE_DISTRIBUTION=gaussian
+export ROLLING_RELATIVE_BETA_CONCENTRATION=3.0
+
+export CHECKPOINT_DIR=ckpt_rolling_transition1
+export CHECKPOINT_EVERY_EPOCHS=50
+export NUM_EPOCHS=3001
+
+export USE_WANDB=1
+export WANDB_PROJECT=flow-matching-pusht
+export WANDB_NAME=rolling_transition_teacher_pusht_obs1_unet2
+
+export TRAIN_ROLLOUT_EVERY_EPOCHS=50
+export TRAIN_ROLLOUT_EPISODES=50
+export TRAIN_ROLLOUT_FIXED_SEEDS=1
+export TRAIN_ROLLOUT_START_SEED=1000
+export TRAIN_ROLLOUT_VIDEO_EPISODES=4
+export TRAIN_ROLLOUT_MAX_STEPS=300
+
+export TEST_START_SEED=1000
+
+venv_fm/bin/python examples/flow_pusht_rolling_renoise.py train

@@ -33,6 +33,7 @@
 
 import sys
 import os
+import random
 import time
 from dataclasses import dataclass
 
@@ -79,16 +80,43 @@ def parse_int_list_env(name: str, default: str) -> list[int]:
     return parsed
 
 
+def seed_everything(seed_value: int) -> None:
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
+
+
+def seed_dataloader_worker(worker_id: int) -> None:
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def make_policy_generator(seed_value: int) -> torch.Generator:
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed_value)
+    return generator
+
+
 ##################################
 ########## download the pusht data and put in the folder
 dataset_path = os.environ.get("PUSHT_DATASET_PATH", "pusht_cchi_v7_replay.zarr.zip")
+
+seed = int(os.environ.get("SEED", "42"))
+dataloader_seed = int(os.environ.get("DATALOADER_SEED", str(seed)))
+train_rollout_policy_seed = int(os.environ.get("TRAIN_ROLLOUT_POLICY_SEED", "2000"))
+test_policy_seed = int(os.environ.get("TEST_POLICY_SEED", "2000"))
 
 obs_horizon = int(os.environ.get("OBS_HORIZON", "2"))
 pred_horizon = 16
 action_dim = 2
 action_horizon = 8
 num_epochs = int(os.environ.get("NUM_EPOCHS", "3001"))
-obs_feature_dim = 514
+condition_previous_action = env_flag("CONDITION_PREVIOUS_ACTION", False)
+obs_feature_dim = 514 + (action_dim if condition_previous_action else 0)
 vision_feature_dim = obs_horizon * obs_feature_dim
 policy_backbone = os.environ.get("POLICY_BACKBONE", "unet").lower()
 unet_diffusion_step_embed_dim = int(os.environ.get("UNET_DIFFUSION_STEP_EMBED_DIM", "128"))
@@ -136,6 +164,7 @@ joint_normalize_residual = os.environ.get("JOINT_NORMALIZE_RESIDUAL", "1").lower
     "no",
 )
 joint_endpoint_param = os.environ.get("JOINT_ENDPOINT_PARAM", "endpoint")
+joint_coarse_origin = os.environ.get("JOINT_COARSE_ORIGIN", "state").lower()
 joint_variable_space = os.environ.get("JOINT_VARIABLE_SPACE", "normalized_action").lower()
 if joint_variable_space == "normalized":
     joint_variable_space = "normalized_action"
@@ -147,7 +176,22 @@ if joint_residual_stats_mode in ("position", "per_token", "token"):
     joint_residual_stats_mode = "per_position"
 elif joint_residual_stats_mode in ("all", "global"):
     joint_residual_stats_mode = "shared"
+joint_residual_parameterization = os.environ.get(
+    "JOINT_RESIDUAL_PARAMETERIZATION",
+    "position",
+).lower()
+if joint_residual_parameterization in ("positional", "position_residual"):
+    joint_residual_parameterization = "position"
+elif joint_residual_parameterization in ("drift", "velocity", "velocity_residual"):
+    joint_residual_parameterization = "drift_velocity"
 joint_endpoint_index = int(os.environ.get("JOINT_ENDPOINT_INDEX", str(action_horizon - 1)))
+joint_mean_velocity_anchor_count = int(
+    os.environ.get("JOINT_MEAN_VELOCITY_ANCHOR_COUNT", "1")
+)
+joint_mean_velocity_coarse_mode = os.environ.get(
+    "JOINT_MEAN_VELOCITY_COARSE_MODE",
+    "state_rays",
+).lower()
 joint_endpoint_token_position = os.environ.get("JOINT_ENDPOINT_TOKEN_POSITION", "endpoint")
 transformer_n_layer = int(os.environ.get("TRANSFORMER_N_LAYER", "8"))
 transformer_n_head = int(os.environ.get("TRANSFORMER_N_HEAD", "4"))
@@ -167,14 +211,47 @@ if joint_loss_mode not in ("token_mean", "separate"):
     raise ValueError("JOINT_LOSS_MODE must be token_mean or separate")
 if joint_endpoint_param not in ("endpoint", "mean_velocity"):
     raise ValueError("JOINT_ENDPOINT_PARAM must be endpoint or mean_velocity")
+if joint_coarse_origin not in ("state", "previous_action"):
+    raise ValueError("JOINT_COARSE_ORIGIN must be state or previous_action")
 if joint_variable_space not in ("normalized_action", "raw_action"):
     raise ValueError("JOINT_VARIABLE_SPACE must be normalized_action or raw_action")
 if joint_variable_norm not in ("zscore", "minmax"):
     raise ValueError("JOINT_VARIABLE_NORM must be zscore or minmax")
 if joint_residual_stats_mode not in ("per_position", "shared"):
     raise ValueError("JOINT_RESIDUAL_STATS_MODE must be per_position or shared")
+if joint_residual_parameterization not in ("position", "drift_velocity"):
+    raise ValueError(
+        "JOINT_RESIDUAL_PARAMETERIZATION must be position or drift_velocity"
+    )
 if not 0 <= joint_endpoint_index < pred_horizon:
     raise ValueError("JOINT_ENDPOINT_INDEX must be in [0, pred_horizon)")
+if joint_mean_velocity_anchor_count < 1:
+    raise ValueError("JOINT_MEAN_VELOCITY_ANCHOR_COUNT must be at least 1")
+if joint_mean_velocity_coarse_mode not in ("state_rays", "continuous_piecewise"):
+    raise ValueError(
+        "JOINT_MEAN_VELOCITY_COARSE_MODE must be state_rays or continuous_piecewise"
+    )
+if joint_endpoint_param != "mean_velocity" and joint_mean_velocity_anchor_count != 1:
+    raise ValueError(
+        "JOINT_MEAN_VELOCITY_ANCHOR_COUNT can exceed 1 only when "
+        "JOINT_ENDPOINT_PARAM=mean_velocity"
+    )
+if (
+    joint_endpoint_param != "mean_velocity"
+    and joint_mean_velocity_coarse_mode != "state_rays"
+):
+    raise ValueError(
+        "JOINT_MEAN_VELOCITY_COARSE_MODE applies only when "
+        "JOINT_ENDPOINT_PARAM=mean_velocity"
+    )
+if (
+    joint_endpoint_param == "mean_velocity"
+    and joint_mean_velocity_anchor_count * (joint_endpoint_index + 1) > pred_horizon
+):
+    raise ValueError(
+        "mean-velocity anchors exceed PRED_HORIZON: reduce "
+        "JOINT_MEAN_VELOCITY_ANCHOR_COUNT or JOINT_ENDPOINT_INDEX"
+    )
 if joint_endpoint_token_position not in ("first", "last", "endpoint"):
     raise ValueError("JOINT_ENDPOINT_TOKEN_POSITION must be first, last, or endpoint")
 if obs_horizon < 1:
@@ -211,12 +288,19 @@ if transformer_n_emb % transformer_n_head != 0:
     raise ValueError("TRANSFORMER_N_EMB must be divisible by TRANSFORMER_N_HEAD")
 if transformer_n_cond_layers < 0:
     raise ValueError("TRANSFORMER_N_COND_LAYERS must be non-negative")
+if min(seed, dataloader_seed, train_rollout_policy_seed, test_policy_seed) < 0:
+    raise ValueError(
+        "SEED, DATALOADER_SEED, TRAIN_ROLLOUT_POLICY_SEED, and "
+        "TEST_POLICY_SEED must be non-negative"
+    )
 if compile_mode == "default":
     compile_mode = None
 amp_dtype = torch.bfloat16 if amp_dtype_name == "bf16" else torch.float16
 use_amp = bool(use_amp and device.type == "cuda")
 pin_memory = bool(pin_memory and device.type == "cuda")
 persistent_workers = bool(persistent_workers and num_workers > 0)
+
+seed_everything(seed)
 
 if device.type == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = use_tf32
@@ -303,6 +387,24 @@ def current_pos_in_action_space(x_pos: torch.Tensor) -> torch.Tensor:
     return _normalize_torch(raw_pos, "action")
 
 
+def previous_action_in_joint_space(x_previous_action: torch.Tensor) -> torch.Tensor:
+    latest_action = x_previous_action[:, obs_horizon - 1, :]
+    if joint_variable_space == "raw_action":
+        return _unnormalize_torch(latest_action, "action")
+    return latest_action
+
+
+def joint_start_in_action_space(
+    x_pos: torch.Tensor,
+    x_previous_action: torch.Tensor | None,
+) -> torch.Tensor:
+    if joint_coarse_origin == "state":
+        return current_pos_in_action_space(x_pos)
+    if x_previous_action is None:
+        raise RuntimeError("previous_action coarse origin requires previous-action input")
+    return previous_action_in_joint_space(x_previous_action)
+
+
 def normalized_action_to_joint_space(x_traj: torch.Tensor) -> torch.Tensor:
     if joint_variable_space == "raw_action":
         return _unnormalize_torch(x_traj, "action")
@@ -323,11 +425,12 @@ def use_endpoint_variable_stats() -> bool:
     )
 
 
-def endpoint_line_from_current_pos(
+def endpoint_line_from_joint_start(
     x_pos: torch.Tensor,
     endpoint: torch.Tensor,
+    x_previous_action: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Straight coarse chunk from current eef position to the endpoint action."""
+    """Straight coarse chunk from the configured origin to the endpoint action."""
 
     # If endpoint_index is inside the executed action horizon, later unexecuted
     # tokens are a constant-velocity extrapolation of that same line.
@@ -340,7 +443,7 @@ def endpoint_line_from_current_pos(
         )
         / float(joint_endpoint_index + 1)
     ).view(1, pred_horizon, 1)
-    start = current_pos_in_action_space(x_pos).unsqueeze(1)
+    start = joint_start_in_action_space(x_pos, x_previous_action).unsqueeze(1)
     return (1.0 - alpha) * start + alpha * endpoint.unsqueeze(1)
 
 
@@ -353,57 +456,227 @@ def joint_step_weights(device: torch.device, dtype: torch.dtype) -> torch.Tensor
     ).view(1, pred_horizon, 1)
 
 
+def joint_anchor_indices() -> list[int]:
+    if joint_endpoint_param != "mean_velocity":
+        return [joint_endpoint_index]
+    stride = joint_endpoint_index + 1
+    return [
+        stride * (anchor_idx + 1) - 1
+        for anchor_idx in range(joint_mean_velocity_anchor_count)
+    ]
+
+
+def joint_anchor_step_weights(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return torch.as_tensor(
+        [index + 1 for index in joint_anchor_indices()],
+        device=device,
+        dtype=dtype,
+    ).view(1, -1, 1)
+
+
 def joint_endpoint_variable_from_endpoint(
     x_pos: torch.Tensor,
     endpoint: torch.Tensor,
+    x_previous_action: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if joint_endpoint_param == "endpoint":
         return endpoint
     if joint_endpoint_param == "mean_velocity":
-        start = current_pos_in_action_space(x_pos)
-        return (endpoint - start) / float(joint_endpoint_index + 1)
+        start = joint_start_in_action_space(x_pos, x_previous_action).unsqueeze(1)
+        steps = joint_anchor_step_weights(endpoint.device, endpoint.dtype)
+        return (endpoint - start) / steps
     raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
 
 
 def endpoint_from_joint_endpoint_variable(
     x_pos: torch.Tensor,
     endpoint_variable: torch.Tensor,
+    x_previous_action: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if joint_endpoint_param == "endpoint":
         return endpoint_variable
     if joint_endpoint_param == "mean_velocity":
-        start = current_pos_in_action_space(x_pos)
-        return start + float(joint_endpoint_index + 1) * endpoint_variable
+        start = joint_start_in_action_space(x_pos, x_previous_action).unsqueeze(1)
+        steps = joint_anchor_step_weights(endpoint_variable.device, endpoint_variable.dtype)
+        return start + steps * endpoint_variable
     raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
+
+
+def continuous_piecewise_line_from_anchors(
+    start: torch.Tensor,
+    anchor_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Interpolate origin -> anchor 1 -> ... and extrapolate any uncovered tail."""
+
+    segments = []
+    previous_position = start
+    previous_step = 0
+    last_segment_velocity = None
+    for anchor_slot, anchor_index in enumerate(joint_anchor_indices()):
+        anchor_step = anchor_index + 1
+        segment_length = anchor_step - previous_step
+        anchor_position = anchor_positions[:, anchor_slot, :]
+        last_segment_velocity = (anchor_position - previous_position) / float(segment_length)
+        offsets = torch.arange(
+            1,
+            segment_length + 1,
+            device=start.device,
+            dtype=start.dtype,
+        ).view(1, segment_length, 1)
+        segments.append(
+            previous_position.unsqueeze(1)
+            + offsets * last_segment_velocity.unsqueeze(1)
+        )
+        previous_position = anchor_position
+        previous_step = anchor_step
+
+    tail_length = pred_horizon - previous_step
+    if tail_length > 0:
+        offsets = torch.arange(
+            1,
+            tail_length + 1,
+            device=start.device,
+            dtype=start.dtype,
+        ).view(1, tail_length, 1)
+        segments.append(
+            previous_position.unsqueeze(1)
+            + offsets * last_segment_velocity.unsqueeze(1)
+        )
+    return torch.cat(segments, dim=1)
 
 
 def joint_line_from_endpoint_variable(
     x_pos: torch.Tensor,
     endpoint_variable: torch.Tensor,
+    x_previous_action: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if joint_endpoint_param == "endpoint":
-        return endpoint_line_from_current_pos(x_pos, endpoint_variable)
+        return endpoint_line_from_joint_start(
+            x_pos,
+            endpoint_variable[:, 0, :],
+            x_previous_action,
+        )
     if joint_endpoint_param == "mean_velocity":
-        start = current_pos_in_action_space(x_pos).unsqueeze(1)
+        start = joint_start_in_action_space(x_pos, x_previous_action).unsqueeze(1)
+        if joint_mean_velocity_coarse_mode == "continuous_piecewise":
+            anchor_positions = endpoint_from_joint_endpoint_variable(
+                x_pos,
+                endpoint_variable,
+                x_previous_action,
+            )
+            return continuous_piecewise_line_from_anchors(
+                start[:, 0, :],
+                anchor_positions,
+            )
         steps = joint_step_weights(endpoint_variable.device, endpoint_variable.dtype)
-        return start + steps * endpoint_variable.unsqueeze(1)
+        stride = joint_endpoint_index + 1
+        segment_ids = torch.div(
+            torch.arange(pred_horizon, device=endpoint_variable.device),
+            stride,
+            rounding_mode="floor",
+        ).clamp(max=endpoint_variable.shape[1] - 1)
+        # Each segment uses the mean velocity from the configured origin to
+        # that segment's anchor. Any uncovered tail keeps the last velocity.
+        segment_velocity = endpoint_variable[:, segment_ids, :]
+        return start + steps * segment_velocity
     raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
 
 
 def decompose_endpoint_residual(
     x_pos: torch.Tensor,
     x_traj: torch.Tensor,
+    x_previous_action: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     x_traj = normalized_action_to_joint_space(x_traj)
-    endpoint = x_traj[:, joint_endpoint_index, :]
-    endpoint_variable = joint_endpoint_variable_from_endpoint(x_pos, endpoint)
-    coarse = joint_line_from_endpoint_variable(x_pos, endpoint_variable)
-    residual = x_traj - coarse
-    return endpoint_variable, residual[:, joint_residual_indices(), :], coarse
+    endpoint = x_traj[:, joint_anchor_indices(), :]
+    endpoint_variable = joint_endpoint_variable_from_endpoint(
+        x_pos,
+        endpoint,
+        x_previous_action,
+    )
+    coarse = joint_line_from_endpoint_variable(
+        x_pos,
+        endpoint_variable,
+        x_previous_action,
+    )
+    position_residual = x_traj - coarse
+    residual_variable = position_residual_to_joint_variable(position_residual)
+    return endpoint_variable, residual_variable, coarse
 
 
 def joint_residual_indices() -> list[int]:
-    return [idx for idx in range(pred_horizon) if idx != joint_endpoint_index]
+    anchor_indices = set(joint_anchor_indices())
+    return [idx for idx in range(pred_horizon) if idx not in anchor_indices]
+
+
+def position_residual_to_joint_variable(
+    position_residual: torch.Tensor,
+) -> torch.Tensor:
+    """Convert coarse-relative positions to the configured residual coordinates."""
+
+    if joint_residual_parameterization == "position":
+        return position_residual[:, joint_residual_indices(), :]
+
+    previous_residual = torch.cat(
+        [torch.zeros_like(position_residual[:, :1, :]), position_residual[:, :-1, :]],
+        dim=1,
+    )
+    drift_velocity = position_residual - previous_residual
+    # Drift at an anchor only closes the preceding segment back to zero. It is
+    # implied by the anchor variable and therefore does not consume a token.
+    return drift_velocity[:, joint_residual_indices(), :]
+
+
+def joint_variable_to_position_residual(
+    residual_variable: torch.Tensor,
+) -> torch.Tensor:
+    """Reconstruct coarse-relative positions, closing drift at every anchor."""
+
+    residual_indices = joint_residual_indices()
+    if residual_variable.shape[1] != len(residual_indices):
+        raise ValueError(
+            f"expected {len(residual_indices)} residual tokens, "
+            f"got {residual_variable.shape[1]}"
+        )
+    if joint_residual_parameterization == "position":
+        position_residual = torch.zeros(
+            residual_variable.shape[0],
+            pred_horizon,
+            action_dim,
+            device=residual_variable.device,
+            dtype=residual_variable.dtype,
+        )
+        position_residual[:, residual_indices, :] = residual_variable
+        return position_residual
+
+    anchor_indices = set(joint_anchor_indices())
+    running_residual = torch.zeros(
+        residual_variable.shape[0],
+        action_dim,
+        device=residual_variable.device,
+        dtype=residual_variable.dtype,
+    )
+    position_steps = []
+    residual_slot = 0
+    for step in range(pred_horizon):
+        if step in anchor_indices:
+            running_residual = torch.zeros_like(running_residual)
+        else:
+            running_residual = running_residual + residual_variable[:, residual_slot, :]
+            residual_slot += 1
+        position_steps.append(running_residual)
+    return torch.stack(position_steps, dim=1)
+
+
+def position_residual_to_joint_variable_np(position_residual: np.ndarray) -> np.ndarray:
+    if joint_residual_parameterization == "position":
+        return position_residual[:, joint_residual_indices(), :]
+    previous_residual = np.concatenate(
+        [np.zeros_like(position_residual[:, :1, :]), position_residual[:, :-1, :]],
+        axis=1,
+    )
+    drift_velocity = position_residual - previous_residual
+    return drift_velocity[:, joint_residual_indices(), :]
 
 
 def _mean_std_min_max_np(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -416,25 +689,27 @@ def _mean_std_min_max_np(data: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.n
 
 
 def compute_joint_residual_stats() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Stats for residual prefix in the configured joint variable coordinates."""
+    """Stats for non-anchor residual variables in the configured coordinates."""
 
     action_chunks, start_action = collect_action_chunks_and_starts()
-    endpoint = action_chunks[:, joint_endpoint_index, :]
+    endpoint = action_chunks[:, joint_anchor_indices(), :]
     endpoint_variable = endpoint_variable_from_endpoint_np(start_action[:, 0, :], endpoint)
     coarse = joint_line_from_endpoint_variable_np(start_action, endpoint_variable)
-    residual_prefix = (action_chunks - coarse)[:, joint_residual_indices(), :]
+    residual_variable = position_residual_to_joint_variable_np(action_chunks - coarse)
     if joint_residual_stats_mode == "shared":
-        residual_prefix = residual_prefix.reshape(-1, action_dim)
-    return _mean_std_min_max_np(residual_prefix)
+        residual_variable = residual_variable.reshape(-1, action_dim)
+    return _mean_std_min_max_np(residual_variable)
 
 
 def collect_action_chunks_and_starts() -> tuple[np.ndarray, np.ndarray]:
     train_data = {
         "agent_pos": dataset.normalized_train_data["agent_pos"],
         "action": dataset.normalized_train_data["action"],
+        "previous_action": dataset.normalized_train_data["previous_action"],
     }
     action_chunks = []
     current_positions = []
+    previous_actions = []
     for buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx in dataset.indices:
         sample = pusht.sample_sequence(
             train_data=train_data,
@@ -446,15 +721,23 @@ def collect_action_chunks_and_starts() -> tuple[np.ndarray, np.ndarray]:
         )
         action_chunks.append(sample["action"])
         current_positions.append(sample["agent_pos"][obs_horizon - 1])
+        previous_actions.append(sample["previous_action"][obs_horizon - 1])
 
     action_chunks = np.asarray(action_chunks, dtype=np.float32)
     current_positions = np.asarray(current_positions, dtype=np.float32)
+    previous_actions = np.asarray(previous_actions, dtype=np.float32)
     current_raw = _unnormalize_np(current_positions, stats["agent_pos"])
     if joint_variable_space == "raw_action":
         action_chunks = _unnormalize_np(action_chunks, stats["action"])
-        start_action = current_raw[:, None, :]
+        if joint_coarse_origin == "previous_action":
+            start_action = _unnormalize_np(previous_actions, stats["action"])[:, None, :]
+        else:
+            start_action = current_raw[:, None, :]
     else:
-        start_action = _normalize_np(current_raw, stats["action"])[:, None, :]
+        if joint_coarse_origin == "previous_action":
+            start_action = previous_actions[:, None, :]
+        else:
+            start_action = _normalize_np(current_raw, stats["action"])[:, None, :]
     return action_chunks, start_action
 
 
@@ -465,8 +748,43 @@ def endpoint_variable_from_endpoint_np(
     if joint_endpoint_param == "endpoint":
         return endpoint
     if joint_endpoint_param == "mean_velocity":
-        return (endpoint - start_action) / float(joint_endpoint_index + 1)
+        steps = np.asarray(
+            [index + 1 for index in joint_anchor_indices()],
+            dtype=np.float32,
+        )[None, :, None]
+        return (endpoint - start_action[:, None, :]) / steps
     raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
+
+
+def continuous_piecewise_line_from_anchors_np(
+    start: np.ndarray,
+    anchor_positions: np.ndarray,
+) -> np.ndarray:
+    segments = []
+    previous_position = start
+    previous_step = 0
+    last_segment_velocity = None
+    for anchor_slot, anchor_index in enumerate(joint_anchor_indices()):
+        anchor_step = anchor_index + 1
+        segment_length = anchor_step - previous_step
+        anchor_position = anchor_positions[:, anchor_slot, :]
+        last_segment_velocity = (anchor_position - previous_position) / float(segment_length)
+        offsets = np.arange(1, segment_length + 1, dtype=np.float32)[None, :, None]
+        segments.append(
+            previous_position[:, None, :]
+            + offsets * last_segment_velocity[:, None, :]
+        )
+        previous_position = anchor_position
+        previous_step = anchor_step
+
+    tail_length = pred_horizon - previous_step
+    if tail_length > 0:
+        offsets = np.arange(1, tail_length + 1, dtype=np.float32)[None, :, None]
+        segments.append(
+            previous_position[:, None, :]
+            + offsets * last_segment_velocity[:, None, :]
+        )
+    return np.concatenate(segments, axis=1)
 
 
 def joint_line_from_endpoint_variable_np(
@@ -474,24 +792,40 @@ def joint_line_from_endpoint_variable_np(
     endpoint_variable: np.ndarray,
 ) -> np.ndarray:
     if joint_endpoint_param == "endpoint":
-        endpoint = endpoint_variable[:, None, :]
+        endpoint = endpoint_variable[:, :1, :]
         alpha = (
             np.arange(1, pred_horizon + 1, dtype=np.float32)
             / float(joint_endpoint_index + 1)
         )[None, :, None]
         return (1.0 - alpha) * start_action + alpha * endpoint
     if joint_endpoint_param == "mean_velocity":
+        if joint_mean_velocity_coarse_mode == "continuous_piecewise":
+            steps = np.asarray(
+                [index + 1 for index in joint_anchor_indices()],
+                dtype=np.float32,
+            )[None, :, None]
+            anchor_positions = start_action + steps * endpoint_variable
+            return continuous_piecewise_line_from_anchors_np(
+                start_action[:, 0, :],
+                anchor_positions,
+            )
         steps = np.arange(1, pred_horizon + 1, dtype=np.float32)[None, :, None]
-        return start_action + steps * endpoint_variable[:, None, :]
+        stride = joint_endpoint_index + 1
+        segment_ids = np.minimum(
+            np.arange(pred_horizon, dtype=np.int64) // stride,
+            endpoint_variable.shape[1] - 1,
+        )
+        segment_velocity = endpoint_variable[:, segment_ids, :]
+        return start_action + steps * segment_velocity
     raise ValueError(f"Unknown JOINT_ENDPOINT_PARAM: {joint_endpoint_param}")
 
 
 def compute_joint_endpoint_variable_stats() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     action_chunks, start_action = collect_action_chunks_and_starts()
-    endpoint = action_chunks[:, joint_endpoint_index : joint_endpoint_index + 1, :]
+    endpoint = action_chunks[:, joint_anchor_indices(), :]
     endpoint_variable = endpoint_variable_from_endpoint_np(
         start_action[:, 0, :],
-        endpoint[:, 0, :],
+        endpoint,
     )
     return _mean_std_min_max_np(endpoint_variable)
 
@@ -597,6 +931,7 @@ if flow_base_mode == "joint_endpoint_residual" and joint_normalize_residual:
     print(
         "Joint residual stats: "
         f"space={joint_variable_space}, norm={joint_variable_norm}, "
+        f"parameterization={joint_residual_parameterization}, "
         f"residual_stats_mode={joint_residual_stats_mode}, "
         f"stats_shape={joint_residual_stats.mean_np.shape}, "
         f"mean_abs={np.abs(joint_residual_stats.mean_np).mean():.4f}, "
@@ -621,16 +956,16 @@ if flow_base_mode == "joint_endpoint_residual" and use_endpoint_variable_stats()
     )
 
 
-def normalize_residual_prefix(residual_prefix: torch.Tensor) -> torch.Tensor:
+def normalize_residual_variable(residual_variable: torch.Tensor) -> torch.Tensor:
     if not joint_normalize_residual:
-        return residual_prefix
-    return joint_residual_stats.normalize(residual_prefix, joint_variable_norm)
+        return residual_variable
+    return joint_residual_stats.normalize(residual_variable, joint_variable_norm)
 
 
-def denormalize_residual_prefix(residual_prefix: torch.Tensor) -> torch.Tensor:
+def denormalize_residual_variable(residual_variable: torch.Tensor) -> torch.Tensor:
     if not joint_normalize_residual:
-        return residual_prefix
-    return joint_residual_stats.denormalize(residual_prefix, joint_variable_norm)
+        return residual_variable
+    return joint_residual_stats.denormalize(residual_variable, joint_variable_norm)
 
 
 def normalize_endpoint_variable(endpoint_variable: torch.Tensor) -> torch.Tensor:
@@ -655,10 +990,20 @@ def sample_flow_timestep(batch_size: int, ref: torch.Tensor) -> torch.Tensor:
     return 0.999 * (1.0 - beta.sample((batch_size,)))
 
 
-def encode_observation(nets_to_use: nn.ModuleDict, x_img: torch.Tensor, x_pos: torch.Tensor) -> torch.Tensor:
+def encode_observation(
+    nets_to_use: nn.ModuleDict,
+    x_img: torch.Tensor,
+    x_pos: torch.Tensor,
+    x_previous_action: torch.Tensor | None = None,
+) -> torch.Tensor:
     image_features = nets_to_use["vision_encoder"](x_img.flatten(end_dim=1))
     image_features = image_features.reshape(*x_img.shape[:2], -1)
-    obs_features = torch.cat([image_features, x_pos], dim=-1)
+    feature_parts = [image_features, x_pos]
+    if condition_previous_action:
+        if x_previous_action is None:
+            raise RuntimeError("CONDITION_PREVIOUS_ACTION=1 requires previous-action input")
+        feature_parts.append(x_previous_action)
+    obs_features = torch.cat(feature_parts, dim=-1)
     if policy_backbone == "transformer":
         return obs_features
     return obs_features.flatten(start_dim=1)
@@ -679,24 +1024,29 @@ def compute_joint_endpoint_residual_loss(
     x_pos: torch.Tensor,
     x_traj: torch.Tensor,
     obs_cond: torch.Tensor,
+    x_previous_action: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = x_traj.shape[0]
-    endpoint_variable, residual_prefix, _ = decompose_endpoint_residual(x_pos, x_traj)
+    endpoint_variable, residual_variable, _ = decompose_endpoint_residual(
+        x_pos,
+        x_traj,
+        x_previous_action,
+    )
     endpoint_variable = normalize_endpoint_variable(endpoint_variable)
-    residual_prefix = normalize_residual_prefix(residual_prefix)
+    residual_variable = normalize_residual_variable(residual_variable)
 
     endpoint_noise = torch.randn_like(endpoint_variable)
-    residual_noise = torch.randn_like(residual_prefix)
+    residual_noise = torch.randn_like(residual_variable)
     timestep = sample_flow_timestep(batch_size, x_traj)
-    t_endpoint = timestep.view(batch_size, 1)
+    t_endpoint = timestep.view(batch_size, 1, 1)
     t_residual = timestep.view(batch_size, 1, 1)
 
     endpoint_t = (1.0 - t_endpoint) * endpoint_noise + t_endpoint * endpoint_variable
-    residual_t = (1.0 - t_residual) * residual_noise + t_residual * residual_prefix
+    residual_t = (1.0 - t_residual) * residual_noise + t_residual * residual_variable
     model_input = pack_joint_tokens(endpoint_t, residual_t)
 
     target_endpoint_v = endpoint_variable - endpoint_noise
-    target_residual_v = residual_prefix - residual_noise
+    target_residual_v = residual_variable - residual_noise
     pred_v = predict_velocity(nets, model_input, timestep, obs_cond)
     pred_endpoint_v, pred_residual_v = unpack_joint_velocity(pred_v)
     endpoint_loss = torch.mean((pred_endpoint_v - target_endpoint_v) ** 2)
@@ -710,10 +1060,10 @@ def compute_joint_endpoint_residual_loss(
 
 
 def pack_joint_tokens(endpoint: torch.Tensor, residual_prefix: torch.Tensor) -> torch.Tensor:
-    # For temporal UNets, the default puts the endpoint variable at its real
-    # action index and fills the other action indices with residual variables.
+    # For temporal UNets, the default puts anchor variables at their real
+    # action indices and fills all remaining indices with residual variables.
     if joint_endpoint_token_position == "first":
-        return torch.cat([endpoint.unsqueeze(1), residual_prefix], dim=1)
+        return torch.cat([endpoint, residual_prefix], dim=1)
     if joint_endpoint_token_position == "endpoint":
         model_input = torch.empty(
             endpoint.shape[0],
@@ -723,32 +1073,34 @@ def pack_joint_tokens(endpoint: torch.Tensor, residual_prefix: torch.Tensor) -> 
             dtype=endpoint.dtype,
         )
         model_input[:, joint_residual_indices(), :] = residual_prefix
-        model_input[:, joint_endpoint_index, :] = endpoint
+        model_input[:, joint_anchor_indices(), :] = endpoint
         return model_input
-    return torch.cat([residual_prefix, endpoint.unsqueeze(1)], dim=1)
+    return torch.cat([residual_prefix, endpoint], dim=1)
 
 
 def unpack_joint_velocity(pred_v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    anchor_count = len(joint_anchor_indices())
     if joint_endpoint_token_position == "first":
-        return pred_v[:, 0, :], pred_v[:, 1:, :]
+        return pred_v[:, :anchor_count, :], pred_v[:, anchor_count:, :]
     if joint_endpoint_token_position == "endpoint":
-        return pred_v[:, joint_endpoint_index, :], pred_v[:, joint_residual_indices(), :]
-    return pred_v[:, -1, :], pred_v[:, :-1, :]
+        return pred_v[:, joint_anchor_indices(), :], pred_v[:, joint_residual_indices(), :]
+    return pred_v[:, -anchor_count:, :], pred_v[:, :-anchor_count, :]
 
 
-def joint_endpoint_token_index() -> int:
+def joint_endpoint_token_indices() -> list[int]:
+    anchor_count = len(joint_anchor_indices())
     if joint_endpoint_token_position == "first":
-        return 0
+        return list(range(anchor_count))
     if joint_endpoint_token_position == "last":
-        return pred_horizon - 1
-    return joint_endpoint_index
+        return list(range(pred_horizon - anchor_count, pred_horizon))
+    return joint_anchor_indices()
 
 
 def token_type_ids_for_sample(sample: torch.Tensor) -> torch.Tensor:
     token_type_ids = torch.zeros(sample.shape[1], device=sample.device, dtype=torch.long)
     if flow_base_mode == "joint_endpoint_residual":
         token_type_ids.fill_(1)
-        token_type_ids[joint_endpoint_token_index()] = 2
+        token_type_ids[joint_endpoint_token_indices()] = 2
     return token_type_ids
 
 
@@ -794,8 +1146,16 @@ def sample_pure_flow_actions(
     nets_to_use: nn.ModuleDict,
     obs_cond: torch.Tensor,
     batch_size: int,
+    *,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    traj = torch.randn(batch_size, pred_horizon, action_dim, device=device)
+    traj = torch.randn(
+        batch_size,
+        pred_horizon,
+        action_dim,
+        device=device,
+        generator=generator,
+    )
     dt = 1.0 / flow_num_steps
     for i in range(flow_num_steps):
         timestep = torch.full((batch_size,), i * dt, device=device)
@@ -808,30 +1168,71 @@ def sample_joint_endpoint_residual_actions(
     nets_to_use: nn.ModuleDict,
     obs_cond: torch.Tensor,
     x_pos: torch.Tensor,
+    x_previous_action: torch.Tensor | None = None,
+    *,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     batch_size = x_pos.shape[0]
-    endpoint = torch.randn(batch_size, action_dim, device=device)
-    residual_prefix = torch.randn(batch_size, pred_horizon - 1, action_dim, device=device)
+    anchor_count = len(joint_anchor_indices())
+    endpoint = torch.randn(
+        batch_size,
+        anchor_count,
+        action_dim,
+        device=device,
+        generator=generator,
+    )
+    residual_variable = torch.randn(
+        batch_size,
+        pred_horizon - anchor_count,
+        action_dim,
+        device=device,
+        generator=generator,
+    )
     dt = 1.0 / flow_num_steps
     for i in range(flow_num_steps):
         timestep = torch.full((batch_size,), i * dt, device=device)
-        model_input = pack_joint_tokens(endpoint, residual_prefix)
+        model_input = pack_joint_tokens(endpoint, residual_variable)
         pred_v = predict_velocity(nets_to_use, model_input, timestep, obs_cond)
         pred_endpoint_v, pred_residual_v = unpack_joint_velocity(pred_v)
         endpoint = endpoint + dt * pred_endpoint_v
-        residual_prefix = residual_prefix + dt * pred_residual_v
+        residual_variable = residual_variable + dt * pred_residual_v
 
-    residual = torch.zeros(batch_size, pred_horizon, action_dim, device=device)
-    residual[:, joint_residual_indices(), :] = denormalize_residual_prefix(residual_prefix)
+    residual_variable = denormalize_residual_variable(residual_variable)
+    position_residual = joint_variable_to_position_residual(residual_variable)
     endpoint_variable_action = denormalize_endpoint_variable(endpoint)
-    traj = joint_line_from_endpoint_variable(x_pos, endpoint_variable_action) + residual
+    traj = (
+        joint_line_from_endpoint_variable(
+            x_pos,
+            endpoint_variable_action,
+            x_previous_action,
+        )
+        + position_residual
+    )
     return joint_space_to_normalized_action(traj)
 
 
-def sample_actions(nets_to_use: nn.ModuleDict, obs_cond: torch.Tensor, x_pos: torch.Tensor) -> torch.Tensor:
+def sample_actions(
+    nets_to_use: nn.ModuleDict,
+    obs_cond: torch.Tensor,
+    x_pos: torch.Tensor,
+    x_previous_action: torch.Tensor | None = None,
+    *,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     if flow_base_mode == "joint_endpoint_residual":
-        return sample_joint_endpoint_residual_actions(nets_to_use, obs_cond, x_pos)
-    return sample_pure_flow_actions(nets_to_use, obs_cond, x_pos.shape[0])
+        return sample_joint_endpoint_residual_actions(
+            nets_to_use,
+            obs_cond,
+            x_pos,
+            x_previous_action,
+            generator=generator,
+        )
+    return sample_pure_flow_actions(
+        nets_to_use,
+        obs_cond,
+        x_pos.shape[0],
+        generator=generator,
+    )
 
 
 def strip_compile_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -874,6 +1275,8 @@ def load_module_state_dict(module: nn.Module, state_dict: dict[str, torch.Tensor
     module.load_state_dict(add_compile_prefix(state_dict))
 
 # create dataloader
+dataloader_generator = torch.Generator()
+dataloader_generator.manual_seed(dataloader_seed)
 dataloader_kwargs = {
     "batch_size": batch_size,
     "num_workers": num_workers,
@@ -881,6 +1284,8 @@ dataloader_kwargs = {
     "drop_last": drop_last,
     "pin_memory": pin_memory,
     "persistent_workers": persistent_workers,
+    "generator": dataloader_generator,
+    "worker_init_fn": seed_dataloader_worker,
 }
 if num_workers > 0:
     dataloader_kwargs["prefetch_factor"] = prefetch_factor
@@ -993,6 +1398,7 @@ def train():
         "train_rollout_video_episodes": train_rollout_video_episodes,
         "train_rollout_max_steps": train_rollout_max_steps,
         "train_rollout_start_seed": train_rollout_start_seed,
+        "train_rollout_policy_seed": train_rollout_policy_seed,
         "train_rollout_fixed_seeds": train_rollout_fixed_seeds,
         "train_rollout_video_fps": train_rollout_video_fps,
     })
@@ -1005,6 +1411,7 @@ def train():
             f"flow_num_steps={flow_num_steps}, "
             f"flow_timestep_distribution={flow_timestep_distribution}, "
             f"obs_horizon={obs_horizon}, "
+            f"condition_previous_action={condition_previous_action}, "
             f"vision_feature_dim={vision_feature_dim}, "
             f"unet_diffusion_step_embed_dim={unet_diffusion_step_embed_dim}, "
             f"unet_down_dims={unet_down_dims}, "
@@ -1021,17 +1428,25 @@ def train():
             f"torch_compile={compile_model}, "
             f"joint_normalize_residual={joint_normalize_residual}, "
             f"joint_endpoint_param={joint_endpoint_param}, "
+            f"joint_coarse_origin={joint_coarse_origin}, "
             f"joint_variable_space={joint_variable_space}, "
             f"joint_variable_norm={joint_variable_norm}, "
             f"joint_residual_stats_mode={joint_residual_stats_mode}, "
+            f"joint_residual_parameterization={joint_residual_parameterization}, "
             f"joint_endpoint_index={joint_endpoint_index}, "
+            f"joint_mean_velocity_anchor_count={joint_mean_velocity_anchor_count}, "
+            f"joint_mean_velocity_coarse_mode={joint_mean_velocity_coarse_mode}, "
+            f"joint_anchor_indices={joint_anchor_indices()}, "
             f"joint_endpoint_token_position={joint_endpoint_token_position}, "
             f"joint_loss_mode={joint_loss_mode}, "
             f"endpoint_loss_weight={endpoint_loss_weight}, "
             f"transformer_n_layer={transformer_n_layer}, "
             f"transformer_n_head={transformer_n_head}, "
             f"transformer_n_emb={transformer_n_emb}, "
-            f"train_rollout_every_epochs={train_rollout_every_epochs}",
+            f"train_rollout_every_epochs={train_rollout_every_epochs}, "
+            f"seed={seed}, "
+            f"dataloader_seed={dataloader_seed}, "
+            f"train_rollout_policy_seed={train_rollout_policy_seed}",
             "cyan",
         )
     )
@@ -1043,19 +1458,29 @@ def train():
         for data in tqdm(dataloader):
             x_img = data['image'][:, :obs_horizon].to(device, non_blocking=pin_memory)
             x_pos = data['agent_pos'][:, :obs_horizon].to(device, non_blocking=pin_memory)
+            x_previous_action = data['previous_action'][:, :obs_horizon].to(
+                device,
+                non_blocking=pin_memory,
+            )
             x_traj = data['action'].to(device, non_blocking=pin_memory)
 
             x_traj = x_traj.float()
             optimizer.zero_grad(set_to_none=True)
 
             with autocast_context():
-                obs_cond = encode_observation(nets, x_img, x_pos)
+                obs_cond = encode_observation(
+                    nets,
+                    x_img,
+                    x_pos,
+                    x_previous_action,
+                )
 
                 if flow_base_mode == "joint_endpoint_residual":
                     loss, endpoint_loss, residual_loss = compute_joint_endpoint_residual_loss(
                         x_pos,
                         x_traj,
                         obs_cond,
+                        x_previous_action,
                     )
                     total_endpoint_loss += endpoint_loss
                     total_residual_loss += residual_loss
@@ -1120,11 +1545,15 @@ def train():
             nets.eval()
             try:
                 rollout_start_seed = train_rollout_start_seed
+                rollout_policy_seed = train_rollout_policy_seed
                 if not train_rollout_fixed_seeds:
-                    rollout_start_seed += epoch * train_rollout_episodes
+                    rollout_seed_offset = epoch * train_rollout_episodes
+                    rollout_start_seed += rollout_seed_offset
+                    rollout_policy_seed += rollout_seed_offset
                 rollout_metrics, rollout_rows, rollout_videos = run_push_t_rollouts(
                     nets,
                     start_seed=rollout_start_seed,
+                    policy_seed_start=rollout_policy_seed,
                     n_episodes=train_rollout_episodes,
                     max_steps=train_rollout_max_steps,
                     video_episodes=train_rollout_video_episodes,
@@ -1172,7 +1601,12 @@ def train():
                         'flow_base_mode': flow_base_mode,
                         'flow_num_steps': flow_num_steps,
                         'flow_timestep_distribution': flow_timestep_distribution,
+                        'seed': seed,
+                        'dataloader_seed': dataloader_seed,
+                        'train_rollout_policy_seed': train_rollout_policy_seed,
+                        'test_policy_seed': test_policy_seed,
                         'obs_horizon': obs_horizon,
+                        'condition_previous_action': condition_previous_action,
                         'obs_feature_dim': obs_feature_dim,
                         'vision_feature_dim': vision_feature_dim,
                         'unet_diffusion_step_embed_dim': unet_diffusion_step_embed_dim,
@@ -1195,10 +1629,14 @@ def train():
                         ) if use_token_embeddings and token_type_embed_dim > 0 else None,
                         'joint_normalize_residual': joint_normalize_residual,
                         'joint_endpoint_param': joint_endpoint_param,
+                        'joint_coarse_origin': joint_coarse_origin,
                         'joint_variable_space': joint_variable_space,
                         'joint_variable_norm': joint_variable_norm,
                         'joint_residual_stats_mode': joint_residual_stats_mode,
+                        'joint_residual_parameterization': joint_residual_parameterization,
                         'joint_endpoint_index': joint_endpoint_index,
+                        'joint_mean_velocity_anchor_count': joint_mean_velocity_anchor_count,
+                        'joint_mean_velocity_coarse_mode': joint_mean_velocity_coarse_mode,
                         'joint_endpoint_token_position': joint_endpoint_token_position,
                         'joint_loss_mode': joint_loss_mode,
                         **joint_endpoint_stats.checkpoint_items("joint_endpoint"),
@@ -1233,6 +1671,10 @@ def init_wandb_for_train(train_config: dict[str, object]):
             "flow_base_mode": flow_base_mode,
             "flow_num_steps": flow_num_steps,
             "flow_timestep_distribution": flow_timestep_distribution,
+            "seed": seed,
+            "dataloader_seed": dataloader_seed,
+            "train_rollout_policy_seed": train_rollout_policy_seed,
+            "test_policy_seed": test_policy_seed,
             "batch_size": batch_size,
             "drop_last": drop_last,
             "num_workers": num_workers,
@@ -1244,12 +1686,18 @@ def init_wandb_for_train(train_config: dict[str, object]):
             "max_train_batches": max_train_batches,
             "checkpoint_dir": checkpoint_dir,
             "checkpoint_every_epochs": checkpoint_every_epochs,
+            "condition_previous_action": condition_previous_action,
             "joint_normalize_residual": joint_normalize_residual,
             "joint_endpoint_param": joint_endpoint_param,
+            "joint_coarse_origin": joint_coarse_origin,
             "joint_variable_space": joint_variable_space,
             "joint_variable_norm": joint_variable_norm,
             "joint_residual_stats_mode": joint_residual_stats_mode,
+            "joint_residual_parameterization": joint_residual_parameterization,
             "joint_endpoint_index": joint_endpoint_index,
+            "joint_mean_velocity_anchor_count": joint_mean_velocity_anchor_count,
+            "joint_mean_velocity_coarse_mode": joint_mean_velocity_coarse_mode,
+            "joint_anchor_indices": joint_anchor_indices(),
             "joint_endpoint_token_position": joint_endpoint_token_position,
             "joint_loss_mode": joint_loss_mode,
             "endpoint_loss_weight": endpoint_loss_weight,
@@ -1308,11 +1756,21 @@ def init_wandb_for_test(checkpoint_path: str, test_config: dict[str, object]):
             "flow_base_mode": flow_base_mode,
             "flow_num_steps": flow_num_steps,
             "flow_timestep_distribution": flow_timestep_distribution,
+            "seed": seed,
+            "dataloader_seed": dataloader_seed,
+            "train_rollout_policy_seed": train_rollout_policy_seed,
+            "test_policy_seed": test_policy_seed,
+            "condition_previous_action": condition_previous_action,
             "joint_endpoint_param": joint_endpoint_param,
+            "joint_coarse_origin": joint_coarse_origin,
             "joint_variable_space": joint_variable_space,
             "joint_variable_norm": joint_variable_norm,
             "joint_residual_stats_mode": joint_residual_stats_mode,
+            "joint_residual_parameterization": joint_residual_parameterization,
             "joint_endpoint_index": joint_endpoint_index,
+            "joint_mean_velocity_anchor_count": joint_mean_velocity_anchor_count,
+            "joint_mean_velocity_coarse_mode": joint_mean_velocity_coarse_mode,
+            "joint_anchor_indices": joint_anchor_indices(),
             "joint_endpoint_token_position": joint_endpoint_token_position,
             "joint_loss_mode": joint_loss_mode,
             "action_horizon": action_horizon,
@@ -1382,6 +1840,7 @@ def run_push_t_rollouts(
     nets_to_use: nn.ModuleDict,
     *,
     start_seed: int,
+    policy_seed_start: int,
     n_episodes: int,
     max_steps: int,
     video_episodes: int,
@@ -1401,9 +1860,16 @@ def run_push_t_rollouts(
     try:
         for episode_index in range(n_episodes):
             seed = start_seed + episode_index
+            policy_seed = policy_seed_start + episode_index
+            policy_generator = make_policy_generator(policy_seed)
             env.seed(seed)
             obs, info = env.reset()
             obs_deque = collections.deque([obs] * obs_horizon, maxlen=obs_horizon)
+            initial_previous_action = np.asarray(obs['agent_pos'], dtype=np.float32)
+            previous_action_deque = collections.deque(
+                [initial_previous_action] * obs_horizon,
+                maxlen=obs_horizon,
+            )
             should_record_video = episode_index < video_episodes
             imgs = [env.render(mode='rgb_array')] if should_record_video else []
             rewards = []
@@ -1419,10 +1885,19 @@ def run_push_t_rollouts(
                 while not done:
                     x_img = np.stack([x['image'] for x in obs_deque])
                     x_pos = np.stack([x['agent_pos'] for x in obs_deque])
+                    x_previous_action = np.stack(previous_action_deque)
                     x_pos = pusht.normalize_data(x_pos, stats=stats['agent_pos'])
+                    x_previous_action = pusht.normalize_data(
+                        x_previous_action,
+                        stats=stats['action'],
+                    )
 
                     x_img = torch.from_numpy(x_img).to(device, dtype=torch.float32)
                     x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.float32)
+                    x_previous_action = torch.from_numpy(x_previous_action).to(
+                        device,
+                        dtype=torch.float32,
+                    )
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                     inference_start = time.perf_counter()
@@ -1431,11 +1906,14 @@ def run_push_t_rollouts(
                             nets_to_use,
                             x_img.unsqueeze(0),
                             x_pos.unsqueeze(0),
+                            x_previous_action.unsqueeze(0),
                         )
                         traj = sample_actions(
                             nets_to_use,
                             obs_cond,
                             x_pos.unsqueeze(0),
+                            x_previous_action.unsqueeze(0),
+                            generator=policy_generator,
                         )
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
@@ -1452,6 +1930,9 @@ def run_push_t_rollouts(
                     for j in range(len(action)):
                         obs, reward, done, _, info = env.step(action[j])
                         obs_deque.append(obs)
+                        previous_action_deque.append(
+                            np.asarray(action[j], dtype=np.float32)
+                        )
                         rewards.append(reward)
                         if should_record_video:
                             imgs.append(env.render(mode='rgb_array'))
@@ -1476,6 +1957,7 @@ def run_push_t_rollouts(
             episode_row = {
                 f"{metric_prefix}/episode_index": episode_index,
                 f"{metric_prefix}/episode_seed": seed,
+                f"{metric_prefix}/episode_policy_seed": policy_seed,
                 f"{metric_prefix}/episode_steps": len(rewards),
                 f"{metric_prefix}/episode_max_reward": episode_max_reward,
                 f"{metric_prefix}/episode_final_reward": episode_final_reward,
@@ -1541,10 +2023,14 @@ def test():
     global flow_base_mode
     global flow_num_steps
     global joint_endpoint_param
+    global joint_coarse_origin
     global joint_variable_space
     global joint_variable_norm
     global joint_residual_stats_mode
+    global joint_residual_parameterization
     global joint_endpoint_index
+    global joint_mean_velocity_anchor_count
+    global joint_mean_velocity_coarse_mode
     global joint_endpoint_token_position
     global joint_endpoint_stats
     global joint_residual_stats
@@ -1560,6 +2046,7 @@ def test():
         )
     checkpoint_arch = {
         "obs_horizon": obs_horizon,
+        "condition_previous_action": condition_previous_action,
         "vision_feature_dim": vision_feature_dim,
     }
     if policy_backbone == "unet":
@@ -1652,6 +2139,20 @@ def test():
                 )
             )
             joint_endpoint_param = checkpoint_endpoint_param
+        checkpoint_coarse_origin = state_dict.get("joint_coarse_origin", "state")
+        if checkpoint_coarse_origin not in ("state", "previous_action"):
+            raise RuntimeError(
+                f"checkpoint has invalid joint_coarse_origin={checkpoint_coarse_origin}"
+            )
+        if checkpoint_coarse_origin != joint_coarse_origin:
+            print(
+                colored(
+                    f"using checkpoint joint_coarse_origin={checkpoint_coarse_origin} "
+                    f"instead of current JOINT_COARSE_ORIGIN={joint_coarse_origin}",
+                    "yellow",
+                )
+            )
+            joint_coarse_origin = checkpoint_coarse_origin
         checkpoint_variable_space = state_dict.get("joint_variable_space", "normalized_action")
         if checkpoint_variable_space == "normalized":
             checkpoint_variable_space = "normalized_action"
@@ -1695,6 +2196,26 @@ def test():
                 )
             )
             joint_residual_stats_mode = checkpoint_residual_stats_mode
+        checkpoint_residual_parameterization = state_dict.get(
+            "joint_residual_parameterization",
+            "position",
+        )
+        if checkpoint_residual_parameterization not in ("position", "drift_velocity"):
+            raise RuntimeError(
+                "checkpoint has invalid joint_residual_parameterization="
+                f"{checkpoint_residual_parameterization}"
+            )
+        if checkpoint_residual_parameterization != joint_residual_parameterization:
+            print(
+                colored(
+                    "using checkpoint joint_residual_parameterization="
+                    f"{checkpoint_residual_parameterization} instead of current "
+                    "JOINT_RESIDUAL_PARAMETERIZATION="
+                    f"{joint_residual_parameterization}",
+                    "yellow",
+                )
+            )
+            joint_residual_parameterization = checkpoint_residual_parameterization
         checkpoint_endpoint_index = state_dict.get("joint_endpoint_index")
         if checkpoint_endpoint_index is None:
             checkpoint_endpoint_index = pred_horizon - 1
@@ -1715,6 +2236,57 @@ def test():
                 )
             )
             joint_endpoint_index = checkpoint_endpoint_index
+        checkpoint_anchor_count = int(
+            state_dict.get("joint_mean_velocity_anchor_count", 1)
+        )
+        if checkpoint_anchor_count != joint_mean_velocity_anchor_count:
+            print(
+                colored(
+                    "using checkpoint joint_mean_velocity_anchor_count="
+                    f"{checkpoint_anchor_count} instead of current "
+                    "JOINT_MEAN_VELOCITY_ANCHOR_COUNT="
+                    f"{joint_mean_velocity_anchor_count}",
+                    "yellow",
+                )
+            )
+            joint_mean_velocity_anchor_count = checkpoint_anchor_count
+        if joint_endpoint_param != "mean_velocity" and joint_mean_velocity_anchor_count != 1:
+            raise RuntimeError(
+                "checkpoint has multiple mean-velocity anchors but "
+                f"joint_endpoint_param={joint_endpoint_param}"
+            )
+        if joint_mean_velocity_anchor_count * (joint_endpoint_index + 1) > pred_horizon:
+            raise RuntimeError(
+                "checkpoint mean-velocity anchors exceed the current PRED_HORIZON"
+            )
+        checkpoint_coarse_mode = state_dict.get(
+            "joint_mean_velocity_coarse_mode",
+            "state_rays",
+        )
+        if checkpoint_coarse_mode not in ("state_rays", "continuous_piecewise"):
+            raise RuntimeError(
+                "checkpoint has invalid joint_mean_velocity_coarse_mode="
+                f"{checkpoint_coarse_mode}"
+            )
+        if checkpoint_coarse_mode != joint_mean_velocity_coarse_mode:
+            print(
+                colored(
+                    "using checkpoint joint_mean_velocity_coarse_mode="
+                    f"{checkpoint_coarse_mode} instead of current "
+                    "JOINT_MEAN_VELOCITY_COARSE_MODE="
+                    f"{joint_mean_velocity_coarse_mode}",
+                    "yellow",
+                )
+            )
+            joint_mean_velocity_coarse_mode = checkpoint_coarse_mode
+        if (
+            joint_endpoint_param != "mean_velocity"
+            and joint_mean_velocity_coarse_mode != "state_rays"
+        ):
+            raise RuntimeError(
+                "checkpoint continuous_piecewise coarse mode requires "
+                "joint_endpoint_param=mean_velocity"
+            )
         checkpoint_token_position = state_dict.get("joint_endpoint_token_position")
         if checkpoint_token_position is None:
             checkpoint_token_position = "first"
@@ -1816,6 +2388,7 @@ def test():
     test_config = {
         "max_steps": max_steps,
         "test_start_seed": test_start_seed,
+        "test_policy_seed": test_policy_seed,
         "test_n": n_test,
         "test_repeats": test_repeats,
         "test_repeat_same_seed": test_repeat_same_seed,
@@ -1840,10 +2413,17 @@ def test():
                 if test_repeat_same_seed
                 else test_start_seed + epoch * test_repeats + pp
             )
+            policy_seed = test_policy_seed + epoch * test_repeats + pp
+            policy_generator = make_policy_generator(policy_seed)
             env.seed(seed)
             obs, info = env.reset()
             obs_deque = collections.deque(
                 [obs] * obs_horizon, maxlen=obs_horizon)
+            initial_previous_action = np.asarray(obs['agent_pos'], dtype=np.float32)
+            previous_action_deque = collections.deque(
+                [initial_previous_action] * obs_horizon,
+                maxlen=obs_horizon,
+            )
             episode_index = len(max_rewards)
             should_record_video = (
                 wandb_run is not None and episode_index < wandb_video_episodes
@@ -1862,10 +2442,19 @@ def test():
                     B = 1
                     x_img = np.stack([x['image'] for x in obs_deque])
                     x_pos = np.stack([x['agent_pos'] for x in obs_deque])
+                    x_previous_action = np.stack(previous_action_deque)
                     x_pos = pusht.normalize_data(x_pos, stats=stats['agent_pos'])
+                    x_previous_action = pusht.normalize_data(
+                        x_previous_action,
+                        stats=stats['action'],
+                    )
 
                     x_img = torch.from_numpy(x_img).to(device, dtype=torch.float32)
                     x_pos = torch.from_numpy(x_pos).to(device, dtype=torch.float32)
+                    x_previous_action = torch.from_numpy(x_previous_action).to(
+                        device,
+                        dtype=torch.float32,
+                    )
                     # infer action
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
@@ -1875,11 +2464,14 @@ def test():
                             ema_nets,
                             x_img.unsqueeze(0),
                             x_pos.unsqueeze(0),
+                            x_previous_action.unsqueeze(0),
                         )
                         traj = sample_actions(
                             ema_nets,
                             obs_cond,
                             x_pos.unsqueeze(0),
+                            x_previous_action.unsqueeze(0),
+                            generator=policy_generator,
                         )
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
@@ -1909,6 +2501,9 @@ def test():
                         obs, reward, done, _, info = env.step(action[j])
                         # save observations
                         obs_deque.append(obs)
+                        previous_action_deque.append(
+                            np.asarray(action[j], dtype=np.float32)
+                        )
                         # and reward/vis
                         rewards.append(reward)
                         if should_record_video:
@@ -1935,6 +2530,7 @@ def test():
                 episode_row = {
                     "eval/episode_index": episode_index,
                     "eval/episode_seed": seed,
+                    "eval/episode_policy_seed": policy_seed,
                     "eval/episode_repeat": pp + 1,
                     "eval/episode_steps": len(rewards),
                     "eval/episode_max_reward": episode_max_reward,

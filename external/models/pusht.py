@@ -608,6 +608,7 @@ class PushTImageEnv(PushTEnv):
 # @markdown  - Pads the beginning and the end of each episode with repetition
 # @markdown  - key `image`: shape (obs_hoirzon, 3, 96, 96)
 # @markdown  - key `agent_pos`: shape (obs_hoirzon, 2)
+# @markdown  - key `previous_action`: shape (obs_horizon, 2)
 # @markdown  - key `action`: shape (pred_horizon, 2)
 
 def create_sample_indices(
@@ -706,6 +707,18 @@ class PushTImageDataset(torch.utils.data.Dataset):
         }
         episode_ends = dataset_root['meta']['episode_ends'][:]
 
+        # The action immediately preceding each observation. At an episode
+        # boundary, use the current agent position as a no-op command instead
+        # of leaking the last action from the previous episode.
+        previous_action = np.empty_like(train_data['action'])
+        episode_start = 0
+        for episode_end in episode_ends:
+            previous_action[episode_start] = train_data['agent_pos'][episode_start]
+            previous_action[episode_start + 1:episode_end] = train_data['action'][
+                episode_start:episode_end - 1
+            ]
+            episode_start = episode_end
+
         # compute start and end of each state-action sequence
         # also handles padding
         indices = create_sample_indices(
@@ -720,6 +733,16 @@ class PushTImageDataset(torch.utils.data.Dataset):
         for key, data in train_data.items():
             stats[key] = get_data_stats(data)
             normalized_train_data[key] = normalize_data(data, stats[key])
+
+        # Previous actions live in exactly the same command space as actions,
+        # so they must use action stats rather than a separately fitted scale.
+        stats['previous_action'] = {
+            name: value.copy() for name, value in stats['action'].items()
+        }
+        normalized_train_data['previous_action'] = normalize_data(
+            previous_action,
+            stats['action'],
+        )
 
         # images are already normalized
         normalized_train_data['image'] = train_image_data
@@ -752,4 +775,5 @@ class PushTImageDataset(torch.utils.data.Dataset):
         # discard unused observations
         nsample['image'] = nsample['image'][:self.obs_horizon, :]
         nsample['agent_pos'] = nsample['agent_pos'][:self.obs_horizon, :]
+        nsample['previous_action'] = nsample['previous_action'][:self.obs_horizon, :]
         return nsample
